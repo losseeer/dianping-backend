@@ -65,7 +65,7 @@ public class UserController {
      */
     @PostMapping("/logout")
     public Result logout(){
-        // TODO 实现登出功能
+        UserHolder.removeUser();
         return Result.fail("功能未完成");
     }
 
