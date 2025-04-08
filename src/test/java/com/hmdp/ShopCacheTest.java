@@ -35,7 +35,7 @@ public class ShopCacheTest {
             String key = RedisConstants.CACHE_SHOP_KEY + shop.getId();
 
             // 将店铺信息写入Redis，并设置逻辑过期时间
-            cacheClient.setWithLogicalExpire(key, shop, RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+            cacheClient.setWithLogicalExpire(key, shop, RedisConstants.CACHE_SHOP_TTL, TimeUnit.HOURS);
         }
 
         System.out.println("All shop information has been cached to Redis.");

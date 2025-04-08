@@ -54,7 +54,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     @Resource
     private CacheClient clientClient;
     @Override
-    public Result queryById(Long id) throws InterruptedException {
+    public Result queryById(Long id){
         /*缓存穿透
         //Shop shop = queryWithPassThrough(id);
         //Shop shop = clientClient
@@ -80,7 +80,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     }
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR= Executors.newFixedThreadPool(10);
-     /*   public Shop queryWithLogicalExpire(Long id)   {
+      /*   public Shop queryWithLogicalExpire(Long id)   {
 //        //1.尝试从Redis查询商铺缓存
 //        String shopJson = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
 //        //2.判断缓存是否存在

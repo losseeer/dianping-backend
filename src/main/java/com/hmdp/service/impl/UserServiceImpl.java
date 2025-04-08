@@ -88,7 +88,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.fail("手机号格式错误");
         }
         //3.校验验证码
-
         String cacheCode = stringRedisTemplate.opsForValue().get(RedisConstants.LOGIN_CODE_KEY+phone);
         if(cacheCode==null||!cacheCode.equals(code)){
            return Result.fail("验证码不一致，请重新输入");
@@ -102,7 +101,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         //6.不存在，创建新用户，保存到数据库
         if(user==null){
            user=createUserWithPhone(phone);
-
         }
         //7.存在 保存到redis
         //7.1 生成个token作为登陆令牌
@@ -116,7 +114,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         //7.3 存储
         String tokenKey=RedisConstants.LOGIN_USER_KEY+token;
         stringRedisTemplate.opsForHash().putAll(tokenKey,map);
-
         stringRedisTemplate.expire(tokenKey,30,TimeUnit.MINUTES);
         //8.返回token
         return Result.ok(token);
@@ -184,7 +181,6 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         User user = new User();
         user.setPhone(phone);
         user.setNickName(SystemConstants.USER_NICK_NAME_PREFIX +RandomUtil.randomString(10));
-
         //保存
         save(user);
         return user;

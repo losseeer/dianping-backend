@@ -3,7 +3,7 @@ package com.hmdp.utils;
 public interface ILock {
     /**
      * 尝试获取锁
-     * @param time
+     * @param timeoutSec
      * @return
      */
      boolean tryLock(long timeoutSec);

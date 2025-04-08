@@ -1,6 +1,11 @@
   server:
     port: 8081
   spring:
+    rabbitmq:
+      host: localhost
+      port: 5672
+      username: guest
+      password: guest
     application:
       name: hmdp
     datasource:
@@ -9,9 +14,9 @@
       username: root
       password: REDACTED
     redis:
-      host: 192.168.42.133
+      host: 127.0.0.1
       port: 6379
-      password: REDACTED
+
       lettuce:
         pool:
           max-active: 30
