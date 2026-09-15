@@ -50,3 +50,7 @@ docs/original_README.md
 
 ### Redis
 dump.rdb
+
+.tutorignore
+tutor.db
+journal.*

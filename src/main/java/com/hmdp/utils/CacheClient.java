@@ -5,12 +5,17 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
+import javax.annotation.PreDestroy;
 import java.time.LocalDateTime;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Collections;
+import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -133,7 +138,53 @@ public class CacheClient {
     }
 
 
-    private static final ExecutorService CACHE_REBUILD_EXECUTOR= Executors.newFixedThreadPool(10);
+    /**
+     * 缓存重建线程池 —— 【八股：为什么禁用Executors.newFixedThreadPool？】
+     *
+     * newFixedThreadPool 的三个隐患（阿里Java规约禁用Executors的原因）：
+     * 1. 队列是无界 LinkedBlockingQueue：DB故障时重建任务无限堆积 → OOM
+     * 2. 默认线程非daemon且无关闭钩子：Spring容器关闭后JVM退不出去
+     * 3. submit()的异常被封进被丢弃的Future，静默消失
+     *
+     * 本池参数对着"缓存重建"业务校准：
+     * - core=2/max=8：重建是低频异步任务，keepAlive 60s 回收空闲线程
+     * - 有界队列32：DB慢时最多积压几十个任务，超出走拒绝策略而非膨胀
+     * - 拒绝策略Discard（记日志）：重建任务可丢——丢了不损数据，下一个请求
+     *   发现key仍逻辑过期会重新触发（天然幂等重试）；CallerRuns反而错：
+     *   会让用户请求线程执行DB重建，违背逻辑过期"用户永不等待"的初衷
+     */
+    private final ThreadPoolExecutor CACHE_REBUILD_EXECUTOR = new ThreadPoolExecutor(
+            2, 8, 60, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(32),
+            r -> {
+                Thread t = new Thread(r, "cache-rebuild");
+                t.setDaemon(true);
+                t.setUncaughtExceptionHandler((thread, e) -> log.error("缓存重建线程未捕获异常", e));
+                return t;
+            },
+            new ThreadPoolExecutor.DiscardPolicy() {
+                @Override
+                public void rejectedExecution(Runnable r, ThreadPoolExecutor executor) {
+                    log.warn("缓存重建队列已满，任务被丢弃，等待下次请求重新触发");
+                    super.rejectedExecution(r, executor);
+                }
+            });
+
+    /** 锁TTL：需覆盖最坏情况下慢DB查询+写回的耗时；过短则锁提前过期放行重复重建 */
+    private static final long LOCK_TTL_SECONDS = 30;
+
+    /** 释放锁脚本：GET比对锁标识一致才DEL，原子防误删（与seckill.lua同款加载方式） */
+    private static final DefaultRedisScript<Long> UNLOCK_SCRIPT;
+    static {
+        UNLOCK_SCRIPT = new DefaultRedisScript<>();
+        UNLOCK_SCRIPT.setLocation(new ClassPathResource("unlock.lua"));
+        UNLOCK_SCRIPT.setResultType(Long.class);
+    }
+
+    @PreDestroy
+    public void shutdownRebuildExecutor() {
+        CACHE_REBUILD_EXECUTOR.shutdown();
+    }
 
     /**
      * 逻辑过期方式解决缓存击穿 —— 【八股：什么是缓存击穿？】
@@ -167,7 +218,7 @@ public class CacheClient {
      * 【八股：为什么用线程池而不是直接new Thread？】
      * - 线程池可以控制并发数，防止线程过多耗尽资源
      * - 线程复用，减少创建销毁线程的开销
-     * - 10个线程足够处理缓存重建任务，因为缓存重建不会太频繁
+     * - 池参数设计（有界队列/拒绝策略/守护线程）见 CACHE_REBUILD_EXECUTOR 字段注释
      */
     public <R,ID> R queryWithLogicalExpire(
             String keyPrefix,ID id,Class<R> type,Function<ID,R> dbFallback,Long time,TimeUnit unit){
@@ -196,29 +247,38 @@ public class CacheClient {
         }
         //5.2.已过期，需要返回缓存重建
         //6.缓存重建
-        //6.1.获取互斥锁
+        //6.1.获取互斥锁（锁value用UUID标识持有者，释放时校验防止误删他人的锁）
         String lockKey=RedisConstants.LOCK_SHOP_KEY+id;
-        boolean isLock = tryLock(lockKey);
+        String lockValue=UUID.randomUUID().toString();
+        boolean isLock = tryLock(lockKey, lockValue);
         //6.2.判断是否获取锁成功
         if(isLock){
-            //  6.3.成功，开启独立线程实现缓存重建
+            //  6.3.成功，提交异步重建任务
             // 【八股：Double Check（双重检查）】
-            // 拿到锁之后，还应该再检查一次缓存是否已经被重建了
-            // 因为可能你等锁的时候，别的线程已经重建完了
-            // 本代码里没有做二次检查，其实是可以优化的点
-            CACHE_REBUILD_EXECUTOR.submit(()->{
+            // 任务开头再读一次缓存：等锁/排队的间隙，可能别的线程已经重建完了
+            // （发现未过期就直接返回，省一次DB查询）
+            CACHE_REBUILD_EXECUTOR.execute(()->{
                 try {
+                    String freshJson = stringRedisTemplate.opsForValue().get(key);
+                    if (StrUtil.isNotBlank(freshJson)) {
+                        RedisData fresh = JSONUtil.toBean(freshJson, RedisData.class);
+                        if (fresh.getExpireTime() != null && fresh.getExpireTime().isAfter(LocalDateTime.now())) {
+                            return;
+                        }
+                    }
                    //查询数据库
                     R r1= dbFallback.apply(id);
                     //写入redis
                     this.setWithLogicalExpire(key,r1,time,unit);
                 } catch (Exception e) {
-                    throw new RuntimeException(e);
+                    // 异步任务的异常必须当场落日志：execute()不似submit()会把异常封进Future
+                    // 静默吞掉——重建失败靠"下一个请求重新触发"自愈，但必须留痕可查
+                    log.error("缓存重建失败 key={}", key, e);
                 }finally {
                     //释放锁：必须传lockKey。历史bug曾误传数据key，导致
-                    // 1) 锁key只能等10s TTL兜底释放，期间其他重建线程抢不到锁
+                    // 1) 锁key只能等TTL兜底释放，期间其他重建线程抢不到锁
                     // 2) 缓存数据key被误删，逻辑过期防击穿失效
-                    unLock(lockKey);
+                    unLock(lockKey, lockValue);
                 }
             });
 
@@ -249,21 +309,23 @@ public class CacheClient {
      * Redis 2.6.12之后SET命令支持NX+EX参数，可以一步完成
      * Spring的setIfAbsent(key, value, timeout, unit)就是封装了这个命令
      *
+     * 【八股：锁value为什么存UUID而不是"1"？】
+     * 释放锁时要校验"锁是不是自己加的"，value必须能标识持有者
+     * 本场景锁由请求线程获取、由池内重建线程释放，不能用线程ID标识
+     *
      * @param key
+     * @param lockValue 锁持有者标识（UUID），释放时校验防误删
      * @return
      */
-    private boolean tryLock(String key){
-        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
+    private boolean tryLock(String key, String lockValue){
+        Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, lockValue, LOCK_TTL_SECONDS, TimeUnit.SECONDS);
         return BooleanUtil.isTrue(flag);
     }
 
     /**
-     * 释放锁
+     * 释放锁 —— 【八股：为什么要"校验+删除"原子化？】
      *
-     * 【八股：这个简易实现有什么问题？】
-     * 问题：直接删除key，可能会误删别人的锁！
-     *
-     * 场景：
+     * 裸DEL的误删场景：
      * 1. 线程A获取锁，设置10秒过期
      * 2. 线程A业务执行了15秒（超过了过期时间）
      * 3. 第10秒时，锁自动过期释放了
@@ -271,13 +333,12 @@ public class CacheClient {
      * 5. 线程A业务执行完了，执行unLock删除锁
      * 6. 线程A把线程B的锁给删了！
      *
-     * 解决方法：
-     * 锁的value存一个唯一标识（比如UUID+线程ID）
-     * 释放锁时先判断是不是自己的锁，是自己的才删除
-     * 而且"判断+删除"也必须是原子操作，要用Lua脚本
+     * 本实现：锁value存UUID标识持有者，unlock.lua里GET比对一致才DEL。
+     * "判断+删除"必须在Lua里原子执行：分开写的话，比对通过后锁恰好过期、
+     * 别人拿到锁，后续DEL还是删了别人的
      * （生产级实现见 Redisson：可重入Hash结构 + 看门狗续期，本项目秒杀已采用）
      */
-    private void unLock(String key){
-        stringRedisTemplate.delete(key);
+    private void unLock(String key, String lockValue){
+        stringRedisTemplate.execute(UNLOCK_SCRIPT, Collections.singletonList(key), lockValue);
     }
 }

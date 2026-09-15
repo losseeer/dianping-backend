@@ -2,9 +2,11 @@ package com.hmdp.config;
 
 import com.hmdp.interceptor.LoginInterceptor;
 import com.hmdp.interceptor.RefreshTokenInterceptor;
+import com.hmdp.utils.SystemConstants;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.ResourceHandlerRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 import javax.annotation.Resource;
@@ -23,6 +25,10 @@ public class MvcConfig implements WebMvcConfigurer {
         registry.addInterceptor(new LoginInterceptor())
                 .excludePathPatterns(
                         "/user/login",
+                        // 图片静态资源不需要登录（拦截器同样会作用到静态资源 Handler 上）
+                        "/imgs/**",
+                        "/blogs/**",
+                        "/types/**",
                         "/upload/**",
                         "/voucher/**",
                         "/user/code",
@@ -41,5 +47,17 @@ public class MvcConfig implements WebMvcConfigurer {
         //token刷新的拦截器
         registry.addInterceptor(new RefreshTokenInterceptor(stringRedisTemplate))
                 .addPathPatterns("/**").order(0);
+    }
+
+    @Override
+    public void addResourceHandlers(ResourceHandlerRegistry registry) {
+        // 本地图片目录静态映射（上传根目录见 SystemConstants.IMAGE_UPLOAD_DIR，默认 ~/hmdp-imgs）
+        // /imgs/**  ：兼容种子数据里的相对路径 /imgs/blogs/blogX.jpg、/imgs/icons/user头像（原教程由 nginx 托管，这里由后端直接接管）
+        // /blogs/** ：对应 UploadController 返回的 /blogs/{d1}/{d2}/{uuid}.jpg
+        // /types/** ：分类导航图标 /types/*.png
+        String dir = SystemConstants.IMAGE_UPLOAD_DIR;
+        registry.addResourceHandler("/imgs/**").addResourceLocations("file:" + dir + "/");
+        registry.addResourceHandler("/blogs/**").addResourceLocations("file:" + dir + "/blogs/");
+        registry.addResourceHandler("/types/**").addResourceLocations("file:" + dir + "/types/");
     }
 }
