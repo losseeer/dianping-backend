@@ -112,17 +112,14 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
 
-        <!-- Guava：RateLimiter令牌桶限流 -->
-        <!-- 【八股：为什么选Guava RateLimiter而不是Sentinel？】
-             1. 轻量级：无需独立Dashboard，嵌入应用即可运行
-             2. 单机限流足够：本项目单体架构，不需要分布式限流
-             3. 面试友好：能讲清令牌桶算法原理
-             如果是微服务架构，选Sentinel（支持集群限流、熔断降级、热点参数限流） -->
-        <dependency>
-            <groupId>com.google.guava</groupId>
-            <artifactId>guava</artifactId>
-            <version>31.1-jre</version>
-        </dependency>
+        <!-- 【八股：为什么不再依赖 Guava RateLimiter？】
+             原先用 Guava 的 RateLimiter 做令牌桶限流，但它是 JVM 进程内对象：
+             部署 N 个实例就是 N 个独立的桶，配置的 qps 实际生效值是 N × qps；
+             而且实例重启后桶是满的，每次发布都白送一波突发流量。
+             现已改为 Redis + Lua 实现（见 RedisRateLimiter / rate-limit.lua），
+             所有实例共用同一个桶，阈值才是真的阈值，依赖也随之移除。
+             如果将来需要规则动态推送、热点参数限流等控制面能力，
+             再考虑引入 Sentinel（它提供集群限流 + Dashboard）。 -->
 
     </dependencies>
 

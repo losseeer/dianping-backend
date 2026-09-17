@@ -92,4 +92,17 @@ public class RedisConstants {
      * 挡手机号枚举攻击：攻击者用大量不同号码轰炸时，按号码限流是挡不住的。
      */
     public static final String SMS_LIMIT_GLOBAL_KEY = "ratelimit:sms:global";
+
+    // ========== 接口限流常量 ==========
+
+    /**
+     * 接口令牌桶前缀 —— Hash { tokens, ts }，由 rate-limit.lua 读写
+     * 完整key: ratelimit:api:{全限定类名}.{方法名}
+     * 例：ratelimit:api:com.hmdp.controller.VoucherOrderController.seckillVoucher
+     *
+     * 为什么用全限定类名：这是个跨实例共享的命名空间，简单类名会碰撞
+     * （将来加一个 admin.UserController 就会和现有的静默共用一个桶）。
+     * TTL 由脚本固定为 2 秒，见 rate-limit.lua 末尾的推导。
+     */
+    public static final String RATE_LIMIT_API_KEY = "ratelimit:api:";
 }

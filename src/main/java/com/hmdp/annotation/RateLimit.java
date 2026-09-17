@@ -12,7 +12,7 @@ import java.lang.annotation.*;
  * 4. 允许一定程度的突发流量（桶里攒的令牌可以瞬间消耗完）
  *
  * 【八股：令牌桶 vs 漏桶的区别】
- * 令牌桶（Guava RateLimiter）：
+ * 令牌桶（本项目的 RedisRateLimiter，Redis + Lua 实现）：
  *   - 允许突发流量（桶里有令牌就可以瞬间放行多个请求）
  *   - 适合"平时低流量，偶尔高并发"的场景（如秒杀）
  *
@@ -58,4 +58,26 @@ public @interface RateLimit {
      * 限流提示消息（fallback为空时使用）
      */
     String message() default "请求过于频繁，请稍后再试";
+
+    /**
+     * Redis 不可用时是否放行。
+     *
+     * <p>
+     * 【八股：fail-open 还是 fail-closed？判据是"降级的代价是丢钱还是丢防护"】
+     * 而不是无脑选一边：
+     * <ul>
+     *   <li><b>失败关闭（failOpen = false）</b>—— 适合丢钱/丢数据一致性的路径。
+     *       秒杀放行会超卖、支付放行会重复扣款，宁可拒绝。
+     *       代价是 Redis 一挂这些接口就不可用。</li>
+     *   <li><b>放行（failOpen = true，默认）</b>—— 适合丢防护的路径。
+     *       登录放行只是暂时失去防撞库、搜索放行只是暂时失去防刷，
+     *       而拒绝会让全站用户登不上、搜不了。可用性优先。</li>
+     * </ul>
+     *
+     * <p>
+     * 【注意】只配了 fail-open 是不够的：客户端必须有超时，否则请求会挂住
+     * 而不是快速降级。见 application.yaml 的 spring.redis.timeout 与
+     * lettuce.pool.max-wait，以及 RedisRateLimiter 里的本地熔断。
+     */
+    boolean failOpen() default true;
 }

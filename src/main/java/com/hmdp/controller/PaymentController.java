@@ -56,7 +56,7 @@ public class PaymentController {
      * @return 支付链接/二维码URL
      */
     @PostMapping
-    @RateLimit(qps = 20, message = "支付操作过于频繁，请稍后再试")
+    @RateLimit(qps = 20, failOpen = false, message = "支付操作过于频繁，请稍后再试")
     public Result pay(@RequestBody PaymentDTO dto) {
         if (dto == null) {
             return Result.fail("支付参数不能为空");

@@ -22,16 +22,25 @@ spring:
     port: 6379
     # 命令超时 —— 不配的默认值是 Lettuce 的 60 秒。
     # 【为什么要配】Redis 不可用时，请求会挂住等这个超时，而不是快速失败。
-    # 实测：停掉 Redis 后 /user/code 挂 >20 秒无任何响应，SmsRateLimiter 的
-    # fail-open 形同虚设 —— 代码是对的，但降级速度以分钟计就等于没有降级。
-    # 本地 Redis 正常耗时在毫秒级，2 秒是极宽松的上限。
-    timeout: 2000ms
+    # 实测：停掉 Redis 后 /user/code 挂 >20 秒无任何响应，fail-open 形同虚设 ——
+    # 代码是对的，但降级速度以分钟计就等于没有降级。
+    #
+    # 【必须大于最长阻塞命令的阻塞时长】SeckillVoucherListener 用的是
+    # XREADGROUP ... BLOCK 2 秒。命令超时必须留出余量，否则每一次阻塞读
+    # 都会在阻塞结束前被掐断，报 RedisCommandTimeoutException —— 表现是
+    # 秒杀订单全部写不进 DB、Redis 库存与 DB 长期不一致（压测 verify 会 FAIL）。
+    # 这里取 3000ms：2 秒阻塞 + 1 秒余量。调小它之前先看这个约束。
+    timeout: 3000ms
     lettuce:
       pool:
         max-active: 30
         max-idle: 15
         min-idle: 5
         time-between-eviction-runs: 10s
+        # 借连接的等待上限。默认是 -1 = 【无限等待】—— 不设它的话，池被占满时
+        # 线程会一直阻塞在 borrowObject() 上，上面的 500ms 命令超时根本不是
+        # 真实上界。而秒杀接口的设计前提就是"拒绝要毫秒级返回"。
+        max-wait: 200ms
   jackson:
     default-property-inclusion: non_null # JSON处理时忽略非空字段
 # Elasticsearch 配置

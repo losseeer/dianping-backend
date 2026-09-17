@@ -56,9 +56,14 @@ public class VoucherOrderController {
      * - 单机8C16G：可以设100-200
      * - 单机2C4G：设50比较安全
      * - 面试时可以说：这个值需要通过压测来确定，50是一个保守估计
+     *
+     * 【八股：为什么这个接口要 failOpen = false？】
+     * 秒杀是丢钱的路径——限流失效会直接超卖。Redis 挂了时宁可拒绝，
+     * 也不能放一批请求进去赌库存扣减能兜住。对比之下，登录/搜索这类
+     * 只是"丢防护"的接口都用默认的 failOpen = true，保证可用性。
      */
     @PostMapping("seckill/{id}")
-    @RateLimit(qps = 50, message = "当前抢购人数过多，请稍后再试")
+    @RateLimit(qps = 50, failOpen = false, message = "当前抢购人数过多，请稍后再试")
     public Result seckillVoucher(@PathVariable("id") Long voucherId) {
         return voucherOrderService.seckillVoucher(voucherId);
     }

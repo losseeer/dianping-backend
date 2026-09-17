@@ -4,6 +4,7 @@ import com.hmdp.dto.Result;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.springframework.util.ClassUtils;
 
 import java.lang.reflect.Method;
 
@@ -18,12 +19,25 @@ public final class AspectFallbackSupport {
     }
 
     /**
-     * 方法标识（类名.方法名），作为限流器/熔断器的 key
+     * 方法标识（全限定类名.方法名），作为限流器/熔断器的 key
+     *
+     * <p>
+     * 【为什么必须用全限定名】这个字符串现在是 Redis 的 key
+     * （{@code ratelimit:api:com.hmdp.controller.UserController.login}），
+     * 是个<strong>跨实例共享的命名空间</strong>。用简单类名的话，将来加一个
+     * {@code admin.UserController} 就会和现有的 UserController 静默共用同一个
+     * 令牌桶——限流阈值互相干扰，而且响应和日志里都看不出来。
+     *
+     * <p>
+     * 【为什么还要 getUserClass】拿到的可能是 CGLIB 增强类，其类名带每 JVM
+     * 生成的随机后缀。若不剥离，每个实例会算出不同的 key —— 分布式限流会
+     * 静默退化成单机限流，而这恰恰是本次改造要修的问题。它也是"单实例测试
+     * 全绿、多实例才出问题"的典型。
      */
     public static String getMethodName(ProceedingJoinPoint joinPoint) {
         MethodSignature signature = (MethodSignature) joinPoint.getSignature();
         Method method = signature.getMethod();
-        return method.getDeclaringClass().getSimpleName() + "." + method.getName();
+        return ClassUtils.getUserClass(method.getDeclaringClass()).getName() + "." + method.getName();
     }
 
     /**
