@@ -75,13 +75,14 @@ Java Spring Boot 后端（:8081）是「快评」平台的**交易与业务核�
 | Redisson | 3.13.6 | 可重入分布式锁 + WatchDog | 比自研 setnx 锁更完善：可重入、自动续期、可重试 |
 | Spring AMQP RabbitMQ | — | 秒杀异步下单 + 死信超时回滚 + 支付通知 + 退款 | 削峰填谷 + 解耦 + 死信天然支持延迟队列 |
 | Spring Data ES + 原生 High Level Client | 7.17 | ES 索引建表 + synonym_graph 配置 + 查询 | High Level Client 支持原生 NativeSearchQuery 满足复杂查询 |
-| Guava | 31.1 | RateLimiter 令牌桶限流 | 轻量级嵌入即可，单机限流场景足够 |
+| Redis + Lua | — | 分布式令牌桶限流（`rate-limit.lua`） | 限流状态必须跨实例共享；Guava 的进程内 RateLimiter 已因此移除 |
 | mysql-connector-java | 8.0.28 | JDBC 驱动 | 兼容 MySQL 8.0+ |
 | Lombok / Hutool 5.7.17 | — | 代码简化 + 工具库 | BeanUtil / JSONUtil / StrUtil 提效 |
 | IK Analyzer | 7.17 | ES 中文分词 | index=ik_max_word / search=ik_smart 双 analyzer |
 
 > 选型对照（面试八股）：
-> - **Guava RateLimiter vs Sentinel**：本项目单体架构单机限流足够；如改为微服务集群限流，应切 Sentinel（支持集群限流、熔断、热点参数）。
+> - **Redis+Lua 令牌桶 vs 单机 Guava RateLimiter**：Guava 的限流器是 JVM 进程内对象，部署 N 个实例阈值就放大 N 倍，且实例重启后桶是满的（每次发布白送一波突发）。本项目已改为 Redis + Lua 实现，状态跨实例共享。
+> - **Redis+Lua vs Sentinel**：本项目要的是"阈值在多实例下成立"，Redis+Lua 已足够且无额外运维成本。Sentinel 的增量价值在**控制面**——规则动态推送（不改代码不重启即可调阈值）、热点参数限流、Dashboard 可视化。需要这些时再引入。
 > - **ES vs MySQL LIKE**：MySQL `LIKE '%kw%'` 无法走索引、不支持分词；ES 基于倒排索引接近 O(1)，支持分词、高亮、相关度排序、聚合。
 > - **synonym_graph vs 普通 synonym filter**：synonym_graph 保留多词条同义词（日本料理 = 日料）的位置偏移关系，不会产生假匹配，短语级 query 精度显著更好。
 > - **Redisson vs 自研 setnx 锁**：自研锁不可重入、无续期、主从一致性有问题；Redisson 用 Hash 存储重入计数 + WatchDog 续期 + multiLock 红锁解决主从一致。
@@ -94,10 +95,10 @@ Java Spring Boot 后端（:8081）是「快评」平台的**交易与业务核�
 src/main/java/com/hmdp/
 ├── HmDianPingApplication.java        # Spring Boot 启动类
 ├── annotation/                        # 自定义注解
-│   ├── RateLimit.java                # @RateLimit 令牌桶限流
+│   ├── RateLimit.java                # @RateLimit 分布式令牌桶限流（含 failOpen 开关）
 │   └── CircuitBreaker.java           # @CircuitBreaker 三态熔断器
 ├── aspect/                            # AOP 切面
-│   ├── RateLimitAspect.java          # 令牌桶实现
+│   ├── RateLimitAspect.java          # 限流切面，委托 RedisRateLimiter
 │   └── CircuitBreakerAspect.java     # 熔断状态机
 ├── config/                            # 配置类
 │   ├── ElasticsearchConfiguration.java  # synonyms.txt 加载 + index settings + DROP+CREATE+IMPORT
@@ -345,7 +346,7 @@ POST /shop/_analyze
 
 | 注解 | 实现 | 使用场景 |
 |---|---|---|
-| `@RateLimit(qps=50, message="活动太火爆了")` | RateLimitAspect + Guava RateLimiter 令牌桶（**单机、全站维度**） | 登录 5QPS / 秒杀 50QPS / 搜索 100QPS / 支付 20QPS |
+| `@RateLimit(qps=50, failOpen=false, message="活动太火爆了")` | RateLimitAspect + RedisRateLimiter（Redis + Lua 令牌桶，**跨实例、全站维度**） | 登录 5QPS / 秒杀 50QPS / 搜索 100QPS / 支付 20QPS |
 | `@CircuitBreaker(failureThreshold=5, recoveryTimeout=30000, slidingWindow=60000, fallback="searchFallback")` | CircuitBreakerAspect + ConcurrentHashMap<方法名, BreakerInfo> | 商铺详情 fallback=MySQL / ES 搜索 fallback=MySQL LIKE |
 
 **三态熔断器状态机**（BreakerState 枚举 + CAS 保证状态转换原子性）：
@@ -404,7 +405,7 @@ wrapper.orderByDesc(Shop::getScore).orderByDesc(Shop::getSold);
 | 数据结构 | 应用场景 | 关键 Key 前缀 | 关键命令 |
 |----------|----------|--------------|----------|
 | **String** | 商铺缓存（逻辑过期防击穿）、验证码、Token、分布式锁、短信限流计数 | `cache:shop:{id}`, `login:token:`, `login:code:`, `ratelimit:sms:cooldown:{phone}`, `ratelimit:sms:daily:{phone}`, `ratelimit:sms:global` | SET（带 EX NX） / GET / INCR |
-| **Hash** | 用户信息（多字段） | `login:token:{token}` | HSET / HGETALL |
+| **Hash** | 用户信息（多字段）、接口限流令牌桶（`{tokens, ts}` 两个字段） | `login:token:{token}`, `ratelimit:api:{全限定类名}.{方法名}` | HSET / HGETALL / HMGET |
 | **Set** | 关注列表、共同关注（交集）、秒杀一人一单记录、协同过滤相似用户 | `follows:{userId}`, `seckill:order:{voucherId}`, `user:liked:shops:{userId}` | SADD / SINTER / SREM / SMEMBERS |
 | **ZSet** | 点赞排行榜（时间戳作为 score 天然排序）、全站热门商铺 | `blog:liked:{blogId}`, `shop:hot` | ZADD / ZREVRANGE / ZRANGEBYSCORE |
 | **GEO** | 附近商户搜索 | `shop:geo:{typeId}` | GEOADD / GEOSEARCH |
@@ -671,7 +672,8 @@ ShopSearchController → ShopSearchServiceImpl.rebuildIndex → ElasticsearchCon
 | 接口被恶意刷 | @RateLimit 令牌桶（秒杀 50QPS / 登录 5QPS / 搜索 100QPS / 支付 20QPS） | RateLimitAspect |
 | 短信被刷爆（按号码循环调用） | 按手机号 60s 冷却 + 每日 10 条 | SmsRateLimiter（Redis + Lua） |
 | 短信被刷爆（多号码枚举轰炸） | 全站兜底闸门，按预算配置额度 | SmsRateLimiter 全局计数键 |
-| 短信限流单机失效 | 限流状态放 Redis 而非 JVM 内存，多实例阈值不放大 | SmsRateLimiter（对比 @RateLimit 的 Guava 单机令牌桶） |
+| 接口限流单机失效 | 限流状态放 Redis 而非 JVM 内存，多实例阈值不放大 | RedisRateLimiter + rate-limit.lua |
+| 限流器 Redis 故障时每个请求都付超时代价 | 连续失败 3 次后本地熔断 10 秒，期间不访问 Redis | RedisRateLimiter 内置熔断 |
 | 熔断器状态转换竞态 | ConcurrentHashMap + AtomicReference + compareAndSet | CircuitBreakerAspect |
 | 循环依赖启动失败 | @Lazy 注入 CGLIB 代理，延迟真实依赖解析 | VoucherOrderServiceImpl.paymentService |
 | LLM 推理超时拖垮 Java | Agent 独立微服务部署，HTTP 调用带超时 | agent-services 独立进程 |
@@ -716,7 +718,7 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 |---|---|---|
 | `login:token:` | Java | 用户登录 Token |
 | `cache:shop:` | Java | 商铺缓存 |
-| `shop:geo:` `shop:hot` `seckill:*` `ratelimit:sms:*` | Java | GEO / 热榜 / 秒杀 / 短信限流 |
+| `shop:geo:` `shop:hot` `seckill:*` `ratelimit:sms:*` `ratelimit:api:*` | Java | GEO / 热榜 / 秒杀 / 短信限流 / 接口限流 |
 | `agent1:summary:` | Agent1 | 评价摘要缓存（TTL 30min） |
 | `agent2:memory:` `agent2:distill:` | Agent2 | 用户偏好 / 蒸馏队列 |
 | `conversation:` | Agent2 | 会话上下文 |
@@ -778,7 +780,7 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 ## 十二、未来扩展点（预留）
 
 1. **MySQL Binlog 增量同步 ES**：当前全量同步（重启重导），生产应用 Canal 监听 Binlog → 增量同步 ES，实现准实时一致
-2. **分布式限流**：当前 Guava 单机限流，微服务化后切 Sentinel 集群限流
+2. **限流控制面**：阈值已能跨实例生效（Redis + Lua 令牌桶），但改阈值仍需改注解并重启。缺的是动态规则推送——引入 Sentinel 或把阈值放进配置中心即可补齐
 3. **Sentinel 替代自研熔断器**：自研三态熔断器满足单机需求，Sentinel 提供更丰富的规则配置 + Dashboard 可视化
 4. **分库分表**：`tb_voucher_order` 按用户 ID 取模分表，RedisIdWorker 已支持分布式 ID
 5. **支付风控**：接入第三方风控（设备指纹、行为分析），PaymentService.payOrder 前置风控检查

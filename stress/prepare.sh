@@ -76,6 +76,11 @@ redis-cli DEL "seckill:order:${VOUCHER_ID}" > /dev/null
 redis-cli --scan --pattern "seckill:order:pending:*" 2>/dev/null | xargs -r -n 100 redis-cli DEL > /dev/null 2>&1 || true
 # 清理库存恢复幂等标记
 redis-cli --scan --pattern "seckill:restored:*" 2>/dev/null | xargs -r -n 100 redis-cli DEL > /dev/null 2>&1 || true
+# 清理上一轮残留的接口令牌桶
+# 【为什么必须清】@RateLimit 已改为 Redis 分布式令牌桶（ratelimit:api:*）。
+# 上一轮压测打空了的桶如果留到这一轮，会压制场景 A 的冷启动突发，
+# "成功下单数"这个数字就会因为与本次改动无关的原因漂移，失去可比性。
+redis-cli --scan --pattern "ratelimit:api:*" 2>/dev/null | xargs -r -n 100 redis-cli DEL > /dev/null 2>&1 || true
 
 echo "验证会话：$(redis-cli HGETALL login:token:tk1)"
 echo "当前 Redis 库存：$(redis-cli GET seckill:stock:${VOUCHER_ID})  (nil 表示尚未预热，首次请求自动创建)"

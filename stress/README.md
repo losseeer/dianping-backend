@@ -37,6 +37,8 @@ open report/index.html
 
 `prepare.sh` 做的三件事：刷新活动窗口（券 105 原 `end_time` 已过期，不改会全部返回"秒杀已经结束"）、从 `tb_user` 取 1000 个**真实** userId 直写 Redis 会话（登录接口有 `@RateLimit(qps=5)`，压测不能走它）、清理上轮 Redis 残留键。
 
+> 清理项里包含 `ratelimit:api:*`——`@RateLimit` 已是 Redis 分布式令牌桶，上一轮打空的桶若留到这一轮会压制场景 A 的冷启动突发，"成功下单数"就会因为与本次改动无关的原因漂移。
+
 ---
 
 ## 二、看什么结果
