@@ -48,6 +48,10 @@ docs/czk.jpg
 docs/resume*
 docs/original_README.md
 
+### 压测产物
+stress/result.jtl
+stress/report/
+
 ### Redis
 dump.rdb
 
