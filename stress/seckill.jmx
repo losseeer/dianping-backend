@@ -29,7 +29,7 @@
           </elementProp>
           <elementProp name="CSV_PATH" elementType="Argument">
             <stringProp name="Argument.name">CSV_PATH</stringProp>
-            <stringProp name="Argument.value">/Users/dedsecczk/Dev/dianping/stress/tokens.csv</stringProp>
+            <stringProp name="Argument.value">tokens.csv</stringProp>
             <stringProp name="Argument.metadata">=</stringProp>
           </elementProp>
         </collectionProp>
@@ -196,7 +196,7 @@
               <connectTime>true</connectTime>
             </value>
           </objProp>
-          <stringProp name="filename">/Users/dedsecczk/Dev/dianping/stress/result.jtl</stringProp>
+          <stringProp name="filename">result.jtl</stringProp>
         </ResultCollector>
         <hashTree/>
       </hashTree>

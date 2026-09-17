@@ -15,7 +15,7 @@
 ## 一、前置准备（必须先做）
 
 ```bash
-cd /Users/dedsecczk/Dev/dianping/stress
+cd /Users/dedsecczk/Dev/dianping/dianping-backend/stress
 ./prepare.sh 105 1000 500      # 券105、1000用户、库存500
 ```
 
@@ -31,6 +31,8 @@ cd /Users/dedsecczk/Dev/dianping/stress
 ## 二、GUI 配置（已生成 jmx，Open 即可；下面是手动搭时的对照清单）
 
 `File → Open → stress/seckill.jmx`，树结构如下：
+
+> ⚠️ GUI 也要**从 `stress/` 目录启动**（`cd stress && $JM/bin/jmeter`）。若从 JMeter 的 `bin/` 启动，`tokens.csv` 会按 `bin/` 解析而找不到。
 
 ```
 快评-秒杀压测 (Test Plan)
@@ -50,7 +52,7 @@ cd /Users/dedsecczk/Dev/dianping/stress
 
 | 元件 | 关键配置 | 为什么这么配 |
 |---|---|---|
-| **User Defined Variables** | `HOST=127.0.0.1` `PORT=8081` `VOUCHER_ID=105` `THREADS=1000` `CSV_PATH=/Users/.../stress/tokens.csv` | 集中管理，改一处即可切换场景。**CSV 与 JTL 都用绝对路径**——JMeter 的相对路径基于启动目录，GUI 从 `bin/` 启动会找不到文件 |
+| **User Defined Variables** | `HOST=127.0.0.1` `PORT=8081` `VOUCHER_ID=105` `THREADS=1000` `CSV_PATH=tokens.csv` | 集中管理，改一处即可切换场景。**CSV 与 JTL 用相对路径**——JMeter 按**启动目录**解析（不是 JMX 所在目录），所以必须先 `cd stress` 再启动 JMeter，否则报 `File tokens.csv must exist and be readable` |
 | **Thread Group** | `Number of Threads = ${THREADS}`(1000)、**Ramp-up = 0**、Loop Count = 1 | Ramp-up=0 才是瞬时并发；渐进爬坡测不出秒杀形态 |
 | **CSV Data Set Config** | Filename `tokens.csv`；Variable Names `token,userId`；Delimiter `,`；**Recycle on EOF = False**；**Stop thread on EOF = True**；Sharing mode = All threads | 每个线程拿一个独立 token，对应一个真实用户 |
 | **HTTP Header Manager** | `authorization: ${token}` | `RefreshTokenInterceptor` L64 读这个 header |
@@ -69,15 +71,22 @@ GUI 只用来搭脚本和单线程调试。**压测必须 CLI**，否则 JMeter 
 
 ```bash
 JM=/Users/dedsecczk/Downloads/apache-jmeter-5.6.3
-cd /Users/dedsecczk/Dev/dianping/stress
-JVM_ARGS="-Xms2g -Xmx4g" $JM/bin/jmeter -n -t seckill.jmx -l result.jtl -e -o ./report
+cd /Users/dedsecczk/Dev/dianping/dianping-backend/stress    # 必须先 cd，相对路径按启动目录解析
+JMETER_COMPLETE_ARGS=true \
+  JVM_ARGS="-Xms2g -Xmx4g -server -Djava.security.egd=file:/dev/urandom" \
+  $JM/bin/jmeter -n -t seckill.jmx -l result.jtl -e -o ./report
 open report/index.html
 ```
+
+> ⚠️ **`JMETER_COMPLETE_ARGS=true` 不能省**。JMeter 启动脚本无条件注入 `-XX:+UseG1GC`，而本机 JDK 1.8.0_491 把它判为实验特性，直接报
+> `Error: VM option 'UseG1GC' is experimental and must be enabled via -XX:+UnlockExperimentalVMOptions` 并退出。
+> 该变量会清空脚本自带的 ARGS，让 `JVM_ARGS` 完全接管（G1 在 JDK 8 上不是必须的，默认 ParallelGC 对压测端吞吐更稳）。
 
 覆盖变量（不用改 jmx）：
 
 ```bash
-$JM/bin/jmeter -n -t seckill.jmx -JTHREADS=2000 -l result.jtl -e -o ./report
+JMETER_COMPLETE_ARGS=true JVM_ARGS="-Xms2g -Xmx4g -server" \
+  $JM/bin/jmeter -n -t seckill.jmx -JTHREADS=2000 -l result.jtl -e -o ./report
 ```
 
 ---
