@@ -345,7 +345,7 @@ POST /shop/_analyze
 
 | 注解 | 实现 | 使用场景 |
 |---|---|---|
-| `@RateLimit(permitsPerSecond=50, fallbackMsg="活动太火爆了")` | RateLimitAspect + Guava RateLimiter 令牌桶 | 登录 5QPS / 验证码 1QPS / 秒杀 50QPS |
+| `@RateLimit(qps=50, message="活动太火爆了")` | RateLimitAspect + Guava RateLimiter 令牌桶（**单机、全站维度**） | 登录 5QPS / 秒杀 50QPS / 搜索 100QPS / 支付 20QPS |
 | `@CircuitBreaker(failureThreshold=5, recoveryTimeout=30000, slidingWindow=60000, fallback="searchFallback")` | CircuitBreakerAspect + ConcurrentHashMap<方法名, BreakerInfo> | 商铺详情 fallback=MySQL / ES 搜索 fallback=MySQL LIKE |
 
 **三态熔断器状态机**（BreakerState 枚举 + CAS 保证状态转换原子性）：
@@ -403,7 +403,7 @@ wrapper.orderByDesc(Shop::getScore).orderByDesc(Shop::getSold);
 
 | 数据结构 | 应用场景 | 关键 Key 前缀 | 关键命令 |
 |----------|----------|--------------|----------|
-| **String** | 商铺缓存（逻辑过期防击穿）、验证码、Token、分布式锁 | `cache:shop:{id}`, `login:token:`, `login:code:` | SET（带 EX NX） / GET / INCR |
+| **String** | 商铺缓存（逻辑过期防击穿）、验证码、Token、分布式锁、短信限流计数 | `cache:shop:{id}`, `login:token:`, `login:code:`, `ratelimit:sms:cooldown:{phone}`, `ratelimit:sms:daily:{phone}`, `ratelimit:sms:global` | SET（带 EX NX） / GET / INCR |
 | **Hash** | 用户信息（多字段） | `login:token:{token}` | HSET / HGETALL |
 | **Set** | 关注列表、共同关注（交集）、秒杀一人一单记录、协同过滤相似用户 | `follows:{userId}`, `seckill:order:{voucherId}`, `user:liked:shops:{userId}` | SADD / SINTER / SREM / SMEMBERS |
 | **ZSet** | 点赞排行榜（时间戳作为 score 天然排序）、全站热门商铺 | `blog:liked:{blogId}`, `shop:hot` | ZADD / ZREVRANGE / ZRANGEBYSCORE |
@@ -539,7 +539,7 @@ ShopSearchController → ShopSearchServiceImpl.rebuildIndex → ElasticsearchCon
 
 | 方法 | 路径 | 说明 | 保护 |
 |------|------|------|------|
-| POST | `/user/code` | 发送验证码 | `@RateLimit(1 QPS)` |
+| POST | `/user/code` | 发送验证码 | `SmsRateLimiter`：按手机号 60s 冷却 + 每日 10 条 + 全站兜底（Redis + Lua） |
 | POST | `/user/login` | 登录（手机号 + 验证码） | `@RateLimit(5 QPS)` |
 | POST | `/user/logout` | 清 Redis Token | 需登录 |
 | GET  | `/user/me` | 当前用户信息 | 需登录 |
@@ -668,7 +668,10 @@ ShopSearchController → ShopSearchServiceImpl.rebuildIndex → ElasticsearchCon
 | ES 宕机搜不到 | @CircuitBreaker fallback MySQL LIKE 4 字段兜底 | ShopSearchServiceImpl.searchFallback |
 | ES 同义词不生效 | rebuild-on-startup=true + rebuild-index 管理接口 + _analyze 验证 | ElasticsearchConfiguration |
 | 商铺详情 DB 压力 | @CircuitBreaker fallback MySQL 直查 | ShopServiceImpl |
-| 接口被恶意刷 | @RateLimit 令牌桶（秒杀 50QPS / 登录 5QPS / 验证码 1QPS） | RateLimitAspect |
+| 接口被恶意刷 | @RateLimit 令牌桶（秒杀 50QPS / 登录 5QPS / 搜索 100QPS / 支付 20QPS） | RateLimitAspect |
+| 短信被刷爆（按号码循环调用） | 按手机号 60s 冷却 + 每日 10 条 | SmsRateLimiter（Redis + Lua） |
+| 短信被刷爆（多号码枚举轰炸） | 全站兜底闸门，按预算配置额度 | SmsRateLimiter 全局计数键 |
+| 短信限流单机失效 | 限流状态放 Redis 而非 JVM 内存，多实例阈值不放大 | SmsRateLimiter（对比 @RateLimit 的 Guava 单机令牌桶） |
 | 熔断器状态转换竞态 | ConcurrentHashMap + AtomicReference + compareAndSet | CircuitBreakerAspect |
 | 循环依赖启动失败 | @Lazy 注入 CGLIB 代理，延迟真实依赖解析 | VoucherOrderServiceImpl.paymentService |
 | LLM 推理超时拖垮 Java | Agent 独立微服务部署，HTTP 调用带超时 | agent-services 独立进程 |
@@ -713,7 +716,7 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 |---|---|---|
 | `login:token:` | Java | 用户登录 Token |
 | `cache:shop:` | Java | 商铺缓存 |
-| `shop:geo:` `shop:hot` `seckill:*` | Java | GEO / 热榜 / 秒杀 |
+| `shop:geo:` `shop:hot` `seckill:*` `ratelimit:sms:*` | Java | GEO / 热榜 / 秒杀 / 短信限流 |
 | `agent1:summary:` | Agent1 | 评价摘要缓存（TTL 30min） |
 | `agent2:memory:` `agent2:distill:` | Agent2 | 用户偏好 / 蒸馏队列 |
 | `conversation:` | Agent2 | 会话上下文 |

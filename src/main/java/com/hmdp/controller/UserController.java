@@ -49,8 +49,17 @@ public class UserController {
      * 【八股：验证码接口为什么需要限流？】
      * 1. 防止短信轰炸：恶意用户循环调用发验证码，消耗短信费用
      * 2. 一条短信0.04元，1秒发100条就是4元，一天就是34万
-     * 3. QPS=1：每秒只允许1次发送，防止被刷
-     * 4. 业务上还应该加"同一手机号60秒内不能重复发送"
+     *
+     * 【为什么这一层不挂 @RateLimit 了？】
+     * 原先这里是 @RateLimit(qps = 1) —— 全站每秒只允许 1 次发送，且是单机
+     * Guava 令牌桶。它有两个问题：
+     *   1) 维度错了：2 个不同用户在同一秒就会互相冲突，5 个攻击者就能让全站
+     *      用户收不到验证码；单机内存态，部署 N 个实例阈值就变成 N 倍
+     *   2) 挡不住这个接口的真实攻击："用大量不同手机号轰炸"（短信泵送，按条
+     *      计费）对每个新号码都是首次发送，按全站 QPS 限只是把攻击者一起限住
+     * 现在改为在 Service 层按手机号限流（SmsRateLimiter，Redis + Lua 分布式），
+     * 三道闸门：同一号码 60 秒冷却 / 每日 10 条 / 全站兜底防枚举。
+     * 放 Service 层还因为手机号格式校验在那里，能避免垃圾入参撑爆 Redis 键空间。
      *
      * 【八股：登录接口为什么也需要限流？】
      * 1. 防止暴力破解：攻击者不断尝试不同验证码/密码
@@ -58,7 +67,6 @@ public class UserController {
      * 3. QPS=5：每秒只允许5次登录，正常用户足够，攻击者受限
      */
     @PostMapping("code")
-    @RateLimit(qps = 1, message = "验证码发送过于频繁，请稍后再试")
     public Result sendCode(@RequestParam("phone") String phone) {
         return userService.sendCode(phone);
     }

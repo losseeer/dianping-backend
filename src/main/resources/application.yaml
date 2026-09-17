@@ -20,6 +20,12 @@ spring:
   redis:
     host: 127.0.0.1
     port: 6379
+    # 命令超时 —— 不配的默认值是 Lettuce 的 60 秒。
+    # 【为什么要配】Redis 不可用时，请求会挂住等这个超时，而不是快速失败。
+    # 实测：停掉 Redis 后 /user/code 挂 >20 秒无任何响应，SmsRateLimiter 的
+    # fail-open 形同虚设 —— 代码是对的，但降级速度以分钟计就等于没有降级。
+    # 本地 Redis 正常耗时在毫秒级，2 秒是极宽松的上限。
+    timeout: 2000ms
     lettuce:
       pool:
         max-active: 30
@@ -50,3 +56,20 @@ logging:
 payment:
   # Public callbacks remain disabled until this environment variable is configured.
   callback-secret: ${PAYMENT_CALLBACK_SECRET:}
+sms:
+  # 验证码发送限流（Redis + Lua，见 SmsRateLimiter / sms-rate-limit.lua）
+  # 【约束】cooldown-seconds 必须 < 验证码自身的 TTL（UserServiceImpl 里写死 2 分钟），
+  #   否则用户收不到短信时，在验证码有效期内连一次重发的机会都没有。
+  rate-limit:
+    # 同一手机号的发送冷却
+    cooldown-seconds: ${SMS_COOLDOWN_SECONDS:60}
+    # 同一手机号的日上限（窗口为滚动 24h，从首次发送起算，不是自然日）
+    daily-limit: ${SMS_DAILY_LIMIT:10}
+    daily-window-seconds: ${SMS_DAILY_WINDOW_SECONDS:86400}
+    # 全站兜底：挡"用大量不同手机号轰炸"（手机号枚举 / 短信泵送）。
+    # 注意这是【预算输入】不是容量推导——上游瓶颈是短信服务商的配额和你的钱包，
+    # 不是这台服务器的处理能力，所以定不了"压测测出来的最优值"。
+    # 默认 60/分钟 是占位值，最坏情况约 8.6 万条/天 ≈ ¥3.4k/天（按 0.04 元/条），
+    # 请按实际短信预算调整。
+    global-limit: ${SMS_GLOBAL_LIMIT:60}
+    global-window-seconds: ${SMS_GLOBAL_WINDOW_SECONDS:60}

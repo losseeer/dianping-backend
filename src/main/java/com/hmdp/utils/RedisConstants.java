@@ -69,4 +69,27 @@ public class RedisConstants {
      * 用于全站热门推荐
      */
     public static final String SHOP_HOT_KEY = "shop:hot:";
+
+    // ========== 短信验证码限流常量 ==========
+
+    /**
+     * 冷却键前缀 —— String，value="1"
+     * 完整key: ratelimit:sms:cooldown:{phone}
+     * 用 SET NX EX 占位，存在即表示冷却中。TTL 即冷却秒数。
+     */
+    public static final String SMS_LIMIT_COOLDOWN_KEY = "ratelimit:sms:cooldown:";
+
+    /**
+     * 日计数键前缀 —— String，value=当日成功发送次数
+     * 完整key: ratelimit:sms:daily:{phone}
+     * 首次自增时设置过期时间，TTL 即日窗口秒数（滚动窗口，非自然日）。
+     */
+    public static final String SMS_LIMIT_DAILY_KEY = "ratelimit:sms:daily:";
+
+    /**
+     * 全局计数键 —— String，value=全局窗口内成功发送次数
+     * 完整key: ratelimit:sms:global
+     * 挡手机号枚举攻击：攻击者用大量不同号码轰炸时，按号码限流是挡不住的。
+     */
+    public static final String SMS_LIMIT_GLOBAL_KEY = "ratelimit:sms:global";
 }

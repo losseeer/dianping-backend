@@ -49,6 +49,10 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
 
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+
+    @Resource
+    private SmsRateLimiter smsRateLimiter;
+
     /**
      * 发送验证码
      * @param phone
@@ -63,16 +67,38 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.fail("手机号格式错误");
         }
 
-        //3.符合，生成验证码
+        //3.限流判定 —— 【八股：为什么限流放在手机号校验之后？】
+        // 校验之前手机号是未经验证的 @RequestParam，攻击者发 10000 个不同的垃圾值
+        // 就能写出 10000 个 Redis 键。校验之后键空间收敛到合法手机号。
+        // 另外放在生成验证码之前，避免先生成一个注定要丢弃的码。
+        SmsRateLimiter.Outcome outcome = smsRateLimiter.tryAcquire(phone);
+        switch (outcome) {
+            case COOLDOWN:
+                return Result.fail("验证码发送过于频繁，请稍后再试");
+            case DAILY_EXCEEDED:
+                return Result.fail("今日验证码发送次数已达上限");
+            case GLOBAL_EXCEEDED:
+                return Result.fail("当前发送人数过多，请稍后再试");
+            case REDIS_UNAVAILABLE:
+                // 告警已在限流器内按间隔打过，这里放行走正常发送流程
+                break;
+            case ALLOWED:
+            default:
+                break;
+        }
+
+        //4.符合，生成验证码
         String code = RandomUtil.randomNumbers(6);
-        //4.保存验证码到redis
+        //5.保存验证码到redis
         // 【八股：为什么验证码存在Redis而不是Session？】
         // 1. 集群环境下Session不共享，Redis天然分布式
         // 2. 设置过期时间方便（Redis自带TTL）
         // 3. 验证码是临时数据，放Redis比放数据库快得多
         // 4. Session是针对每个用户的，验证码只需要手机号作为key就行
-       stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_CODE_KEY +phone,code,2, TimeUnit.MINUTES);
-        //5.发送验证码
+        // 注意：这里的 TTL 必须大于 sms.rate-limit.cooldown-seconds，否则用户
+        // 收不到短信时，在验证码有效期内连一次重发的机会都没有。
+        stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_CODE_KEY +phone,code,2, TimeUnit.MINUTES);
+        //6.发送验证码
         log.info("短信验证码发送成功：{}",code);
 
         return Result.ok();
