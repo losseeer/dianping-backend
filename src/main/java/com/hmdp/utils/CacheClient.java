@@ -4,6 +4,8 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -40,10 +42,34 @@ import java.util.function.Function;
 @Component
 public class CacheClient {
     private final StringRedisTemplate stringRedisTemplate;
+    private final MeterRegistry meterRegistry;
 
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate) {
+    public CacheClient(StringRedisTemplate stringRedisTemplate, MeterRegistry meterRegistry) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.meterRegistry = meterRegistry;
+        // 重建线程池的队列深度/活跃线程/被丢弃任务数由 Micrometer 现成的采集器提供。
+        // 这里必须采：队列打满时走的是 DiscardPolicy（只有一行 warn 日志），
+        // 表现为"缓存一直是旧的、stale_served 一直下不来"，却没有任何请求报错。
+        ExecutorServiceMetrics.monitor(meterRegistry, CACHE_REBUILD_EXECUTOR, "cache-rebuild");
+    }
+
+    /**
+     * 缓存查询结果计数。
+     *
+     * 【为什么要自己埋而不是看 Redis 的 keyspace_hits/misses】后者是整个实例的全局
+     * 计数，把秒杀库存、Token、限流桶和商铺缓存混在一起，算不出"商铺详情命中率"
+     * 这种业务口径；而且它只统计 GET 命中的 key，分不清"命中了防穿透的空值"。
+     *
+     * @param cache 缓存命名空间（即 keyPrefix，如 shop:id:），基数等于接入的缓存种类数
+     */
+    private void countLookup(String cache, String result) {
+        meterRegistry.counter("dianping.cache.lookup", "cache", cache, "result", result).increment();
+    }
+
+    /** 重建尝试计数：claimed=本次抢到锁 / skipped=锁被占 / failed=重建任务抛异常 */
+    private void countRebuild(String cache, String outcome) {
+        meterRegistry.counter("dianping.cache.rebuild", "cache", cache, "outcome", outcome).increment();
     }
 
 
@@ -110,13 +136,17 @@ public class CacheClient {
         //2.判断缓存是否存在
         if(StrUtil.isNotBlank(json)) { //判断字符串既不为null，也不是空字符串(""),且也不是空白字符
             //3.存在，返回商铺信息
+            countLookup(keyPrefix, "hit");
             return JSONUtil.toBean(json, type);
 
         }
         //判断是否为空值 —— 【八股：空值判断的细节】
         // json不为null但内容是空字符串，说明这是我们缓存的空值（防穿透用的）
         // 直接返回null，不再查数据库，这就是缓存穿透防护
+        // 【指标口径】null_hit 单独成一档：它不查 DB，算命中；和 miss_db_absent
+        // 混在一起的话，"缓存挡掉了多少穿透请求"就再也算不出来了。
         if(json!=null){
+            countLookup(keyPrefix, "null_hit");
             return null;
         }
         //4.不存在，根据id查询数据库
@@ -128,10 +158,12 @@ public class CacheClient {
             // 数据库也不存在，就缓存一个空字符串，设置较短过期时间
             // 下次再来查同样的id，直接从缓存拿到空值，不会打到数据库
             stringRedisTemplate.opsForValue().set(key,"",RedisConstants.CACHE_NULL_TTL,TimeUnit.MINUTES);
+            countLookup(keyPrefix, "miss_db_absent");
             return null;
         }
         //7.存在，写入redis，返回商铺信息
        this.set(key,r,time,unit);
+        countLookup(keyPrefix, "miss_db_found");
 
         return r;
 
@@ -232,17 +264,34 @@ public class CacheClient {
             // 逻辑过期方案假设热点key已经预热到缓存中了（key无物理TTL，理论上常驻）
             // 如果缓存里根本没有，说明不是热点数据，走queryWithPassThrough兜底
             // （真实项目中应该配合缓存预热机制，把热点数据提前加载）
+            // 【指标口径】这一档在监控上是要盯的异常信号而非常规命中路径：
+            // 它说明预热没做到位，请求正落回 queryWithPassThrough 打 DB。
+            countLookup(keyPrefix, "not_cached");
             return null;
 
         }
 
         //4.存在，将json反序列化为对象
         RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        // 【两种缓存策略共用一个 key，值格式必须都认得】
+        // queryWithPassThrough 回填的是"裸 JSON + 物理 TTL"（见 set()），而本方法假定读到的
+        // 是逻辑过期信封 RedisData。ShopServiceImpl.queryById 先走本方法、拿不到再走穿透兜底，
+        // 同一个 key 的两种写法就会互相撞上：以前照 RedisData 取 expireTime 去比时间，
+        // 撞上裸 JSON 直接 NPE，被熔断器降级成一次 DB 查询 —— 客户端依然 200，所以谁也没发现。
+        // 裸 JSON 本身就是刚回填、带物理 TTL 的有效值，认下来直接返回，还省掉后面那趟回源。
+        // 指标上单独记 hit_plain：这个数不为零就说明两种策略仍在共用 key，是可收敛的信号。
+        if (redisData == null || redisData.getExpireTime() == null
+                || !(redisData.getData() instanceof JSONObject)) {
+            R plain = JSONUtil.toBean(json, type);
+            countLookup(keyPrefix, "hit_plain");
+            return plain;
+        }
         R shop = JSONUtil.toBean((JSONObject) redisData.getData(),type);
         LocalDateTime expireTime = redisData.getExpireTime();
         //5.判断是否过期
         if(expireTime.isAfter(LocalDateTime.now())) {
             //5.1.未过期，直接返回店铺信息
+            countLookup(keyPrefix, "hit");
             return shop;
         }
         //5.2.已过期，需要返回缓存重建
@@ -251,12 +300,16 @@ public class CacheClient {
         String lockKey=RedisConstants.LOCK_SHOP_KEY+id;
         String lockValue=UUID.randomUUID().toString();
         boolean isLock = tryLock(lockKey, lockValue);
+        // 【指标口径】stale_served = 用户拿到了逻辑已过期的旧数据。这是逻辑过期方案
+        // 唯一的"不一致"证据，量级突然放大说明 DB 或重建线程出了问题。
+        countLookup(keyPrefix, "stale_served");
         //6.2.判断是否获取锁成功
         if(isLock){
             //  6.3.成功，提交异步重建任务
             // 【八股：Double Check（双重检查）】
             // 任务开头再读一次缓存：等锁/排队的间隙，可能别的线程已经重建完了
             // （发现未过期就直接返回，省一次DB查询）
+            countRebuild(keyPrefix, "claimed");
             CACHE_REBUILD_EXECUTOR.execute(()->{
                 try {
                     String freshJson = stringRedisTemplate.opsForValue().get(key);
@@ -273,6 +326,9 @@ public class CacheClient {
                 } catch (Exception e) {
                     // 异步任务的异常必须当场落日志：execute()不似submit()会把异常封进Future
                     // 静默吞掉——重建失败靠"下一个请求重新触发"自愈，但必须留痕可查
+                    // 【指标口径】留痕现在也要可查：靠日志数不出"这一分钟重建失败了几次"，
+                    // 而反复失败会让 stale_served 一直涨，两个指标对着看才定位得准。
+                    countRebuild(keyPrefix, "failed");
                     log.error("缓存重建失败 key={}", key, e);
                 }finally {
                     //释放锁：必须传lockKey。历史bug曾误传数据key，导致
@@ -282,6 +338,9 @@ public class CacheClient {
                 }
             });
 
+        } else {
+            // 锁被别的请求持有，本次不重建（正常现象：热点key过期瞬间只有一个赢家）
+            countRebuild(keyPrefix, "skipped");
         }
 
         //6.4.返回过期的商铺信息

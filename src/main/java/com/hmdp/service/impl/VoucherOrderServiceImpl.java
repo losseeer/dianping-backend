@@ -2,6 +2,7 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.json.JSONUtil;
+import io.micrometer.core.instrument.MeterRegistry;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
@@ -83,6 +84,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Resource
     private TransactionOutboxWriter outboxWriter;
+
+    @Resource
+    private MeterRegistry meterRegistry;
 
     private final TransactionTemplate transactionTemplate;
 
@@ -259,9 +263,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         );
         //2.判断结果是否为0（返回码约定见 SECKILL_SCRIPT 常量声明处）
         if (result == null) {
+            countPrecheck("redis_error");
             return Result.fail("秒杀服务异常，请稍后重试");
         }
         int r = result.intValue();
+        countPrecheck(precheckTag(r));
         if (r != SECKILL_OK) {
             //2.1.不为0，代表没有购买资格
             if (r == SECKILL_STOCK_NOT_INITIALIZED) return Result.fail("秒杀库存尚未初始化");
@@ -270,6 +276,32 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         // Redis Lua 已原子写入预订单和订单事件，异步消费者负责落库。
         return Result.ok(orderId);
+    }
+
+    /**
+     * 秒杀预检结果计数（Redis + Lua 那一步的返回码分布）。
+     *
+     * 【这张曲线怎么用】out_of_stock 的爬升速度就是"活动还剩多久"，
+     * duplicated 反映的是重试还是刷子，redis_error 则对应限流 failOpen=false
+     * 之外唯一的整体失败面。这三个数以前只能事后翻日志。
+     */
+    private void countPrecheck(String reason) {
+        meterRegistry.counter("dianping.seckill.precheck", "reason", reason).increment();
+    }
+
+    private static String precheckTag(int code) {
+        switch (code) {
+            case SECKILL_OK:
+                return "ok";
+            case SECKILL_STOCK_NOT_INITIALIZED:
+                return "stock_not_initialized";
+            case SECKILL_OUT_OF_STOCK:
+                return "out_of_stock";
+            case SECKILL_DUPLICATED:
+                return "duplicated";
+            default:
+                return "unknown";
+        }
     }
 
     @Override

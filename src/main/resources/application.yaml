@@ -62,6 +62,25 @@ mybatis-plus:
 logging:
   level:
     com.hmdp: info
+management:
+  endpoints:
+    web:
+      # 只暴露这两个：include=* 会把 env/beans/heapdump 一起开到 8081 上，
+      # 其中 env 直接可读配置、heapdump 能把堆拖成一个几百 MB 的文件。
+      exposure:
+        include: health,prometheus
+  metrics:
+    tags:
+      # 多实例部署后所有指标都带 application 维度，Prometheus 侧按实例聚合时必需
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        # 【为什么必须开直方图】Micrometer 自己算的 percentile 不会出现在
+        # /actuator/prometheus 里；只有开了 histogram 才会导出
+        # http_server_requests_seconds_bucket，Prometheus 侧才能用
+        # histogram_quantile() 算服务端 P99——这是替代"Postman 手跑 200 次"
+        # 的前提。代价是每个 bucket 一条时间序列，桶数固定（约 11 个）不随基数增长。
+        http.server.requests: true
 payment:
   # Public callbacks remain disabled until this environment variable is configured.
   callback-secret: ${PAYMENT_CALLBACK_SECRET:}

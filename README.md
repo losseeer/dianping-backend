@@ -10,6 +10,7 @@
 | 存储 | MySQL 8（唯一约束兜底 + 条件更新乐观锁）/ Redis（缓存 / 锁 / 全局 ID / Stream） |
 | 消息 | RabbitMQ（延迟队列 / 通知 / Outbox 发布）/ Redis Stream（秒杀异步落库） |
 | 搜索 | Elasticsearch（IK 分词 + synonym_graph 同义词扩展） |
+| 可观测 | Micrometer + Prometheus 端点（缓存命中 / 限流判定 / 熔断状态跃迁 / Outbox 积压 / 服务端 P99 直方图） |
 | 压测 | JMeter（`stress/` 含场景脚本、数据准备与校验脚本） |
 
 ## 核心设计
@@ -18,7 +19,7 @@
 2. **秒杀链路**：Lua 原子预检（库存 + 一人一单）→ Redis Stream 异步落库（消费者组 ACK/XCLAIM 故障转移）→ 死信队列 30 分钟超时取消
 3. **订单状态机 + 支付闭环**：`UNPAID→PAID→VERIFIED / REFUNDING→REFUNDED` 六态状态机；取消与支付竞态由条件 UPDATE 裁决；`tb_pay_log` 流水幂等 + 迟到支付自动原路退款
 4. **DB 兜底约束**：`uk_active_user_voucher` / `uk_pending_order` 终态置 NULL 的部分唯一索引，从存储层杜绝超卖与重复支付
-5. **Outbox 模式**：支付通知、退款、Redis 补偿等跨链路消息先随业务事务落库，再由 publisher 轮询投递，保证事务与消息最终一致
+5. **Outbox 模式**：支付通知、退款、Redis 补偿等跨链路消息先随业务事务落库，再由 publisher 轮询投递，保证事务与消息最终一致；退避重试封顶后仍失败的事件超过 `max-retry`（默认 20 次 ≈ 70 分钟）判定为死信（`status=3`）停止重试，整行留在表里供人工核对重放
 6. **搜索熔断降级**：ES 检索失败时熔断打开并回退 MySQL LIKE 兜底；`synonym_graph` 放在 search analyzer 侧，同义词热更新无需重建索引
 
 ## 快速开始

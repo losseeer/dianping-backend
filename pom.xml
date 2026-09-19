@@ -121,6 +121,22 @@
              如果将来需要规则动态推送、热点参数限流等控制面能力，
              再考虑引入 Sentinel（它提供集群限流 + Dashboard）。 -->
 
+        <!-- 可观测性：指标出口。
+             【为什么只要这两个依赖】Boot 2.3 自带 Micrometer 1.5（由 parent 管版本），
+             actuator 负责 /actuator 端点与内置采集（JVM / HikariCP / HTTP / RabbitMQ 监听），
+             registry-prometheus 负责把 MeterRegistry 渲染成 Prometheus 文本格式。
+             不引 Sleuth / Spring Boot Admin：traceId 由自有 filter 写 MDC 即可贯通，
+             前者依赖重且要与本项目的两个拦截器、Stream 消费者逐个适配。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
     </dependencies>
 
     <build>

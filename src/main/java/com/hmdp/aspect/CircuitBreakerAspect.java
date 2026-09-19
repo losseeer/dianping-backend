@@ -4,12 +4,15 @@ import com.hmdp.annotation.CircuitBreaker;
 import com.hmdp.dto.Result;
 import com.hmdp.enums.BreakerState;
 import com.hmdp.model.BreakerInfo;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Tags;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
 import org.springframework.stereotype.Component;
 
+import javax.annotation.Resource;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -64,13 +67,18 @@ public class CircuitBreakerAspect {
      */
     private final ConcurrentHashMap<String, BreakerInfo> breakers = new ConcurrentHashMap<>();
 
+    @Resource
+    private MeterRegistry meterRegistry;
+
     @Around("@annotation(circuitBreaker)")
     public Object around(ProceedingJoinPoint joinPoint, CircuitBreaker circuitBreaker) throws Throwable {
         String methodName = getMethodName(joinPoint);
+        // computeIfAbsent 的映射函数对同一个 key 至多执行一次，所以指标注册也恰好一次；
+        // 不能改用 MeterBinder 在启动时批量注册——breakers 是首次请求才填充的，那时还是空的。
         BreakerInfo breaker = breakers.computeIfAbsent(methodName, k -> {
             log.info("初始化熔断器: {} | 失败阈值: {} | 恢复时间: {}ms",
-                    methodName, circuitBreaker.failureThreshold(), circuitBreaker.recoveryTimeout());
-            return new BreakerInfo();
+                    k, circuitBreaker.failureThreshold(), circuitBreaker.recoveryTimeout());
+            return newBreakerWithMeters(k);
         });
 
         // 获取当前状态
@@ -87,12 +95,13 @@ public class CircuitBreakerAspect {
                 // 如果多个线程同时到达，只有一个能成功转换
                 if (breaker.getState().compareAndSet(BreakerState.OPEN, BreakerState.HALF_OPEN)) {
                     breaker.resetCounters();
+                    recordTransition(methodName, BreakerState.OPEN, BreakerState.HALF_OPEN);
                     log.info("熔断器 [{}] OPEN → HALF_OPEN，开始探测", methodName);
                 }
             } else {
                 // 还没到恢复时间，直接降级
                 log.warn("熔断器 [{}] 处于OPEN状态，直接降级", methodName);
-                return doFallback(joinPoint, circuitBreaker);
+                return doFallback(joinPoint, circuitBreaker, methodName, "open");
             }
             // 重新读取状态（可能已被其他线程改成HALF_OPEN）
             state = breaker.getState().get();
@@ -105,7 +114,7 @@ public class CircuitBreakerAspect {
             // 只放1个探测请求，成功才完全恢复
             if (!breaker.getProbeSent().compareAndSet(false, true)) {
                 // 已经有探测请求在进行中，其他请求直接降级
-                return doFallback(joinPoint, circuitBreaker);
+                return doFallback(joinPoint, circuitBreaker, methodName, "probe_in_progress");
             }
             log.info("熔断器 [{}] HALF_OPEN，放行探测请求", methodName);
         }
@@ -126,6 +135,7 @@ public class CircuitBreakerAspect {
                 // 探测成功，恢复为CLOSED —— 【八股：探测成功恢复流程】
                 breaker.getState().set(BreakerState.CLOSED);
                 breaker.resetCounters();
+                recordTransition(methodName, BreakerState.HALF_OPEN, BreakerState.CLOSED);
                 log.info("熔断器 [{}] HALF_OPEN → CLOSED，探测成功，恢复正常", methodName);
             }
 
@@ -137,7 +147,9 @@ public class CircuitBreakerAspect {
             int failures = breaker.getFailureCount().incrementAndGet();
             breaker.setLastFailureTime(System.currentTimeMillis());
 
-            log.warn("熔断器 [{}] 方法执行失败，当前失败次数: {}", methodName, failures);
+            // 异常必须进日志：降级会让客户端拿到一个"看起来正常"的响应（fallback 查 DB），
+            // 只有指标计到一次 failure —— 如果这里不打堆栈，这条 failure 永远查不出原因。
+            log.warn("熔断器 [{}] 方法执行失败，当前失败次数: {}", methodName, failures, e);
 
             BreakerState current = breaker.getState().get();
             if (current == BreakerState.HALF_OPEN) {
@@ -145,6 +157,7 @@ public class CircuitBreakerAspect {
                 breaker.getState().set(BreakerState.OPEN);
                 breaker.setOpenTime(System.currentTimeMillis());
                 breaker.resetCounters();
+                recordTransition(methodName, BreakerState.HALF_OPEN, BreakerState.OPEN);
                 log.error("熔断器 [{}] HALF_OPEN → OPEN，探测失败，重新熔断", methodName);
             } else if (current == BreakerState.CLOSED) {
                 // CLOSED状态下检查是否需要熔断
@@ -152,6 +165,7 @@ public class CircuitBreakerAspect {
                 if (failures >= circuitBreaker.failureThreshold()) {
                     if (breaker.getState().compareAndSet(BreakerState.CLOSED, BreakerState.OPEN)) {
                         breaker.setOpenTime(System.currentTimeMillis());
+                        recordTransition(methodName, BreakerState.CLOSED, BreakerState.OPEN);
                         log.error("熔断器 [{}] CLOSED → OPEN，失败次数 {} 达到阈值 {}",
                                 methodName, failures, circuitBreaker.failureThreshold());
                     }
@@ -159,8 +173,47 @@ public class CircuitBreakerAspect {
             }
 
             // 返回降级响应
-            return doFallback(joinPoint, circuitBreaker);
+            return doFallback(joinPoint, circuitBreaker, methodName, "failure");
         }
+    }
+
+    /**
+     * 创建熔断器并挂上它的指标。
+     *
+     * 只在某个受保护方法第一次被调用时执行一次（见 around() 里的 computeIfAbsent）。
+     * 之所以不在启动时批量注册：breakers 这个 map 本身就是懒填充的。
+     */
+    private BreakerInfo newBreakerWithMeters(String api) {
+        BreakerInfo breaker = new BreakerInfo();
+        Tags tags = Tags.of("api", api);
+        // 状态编码刻意不用 ordinal()：BreakerState 的声明顺序是 CLOSED, OPEN, HALF_OPEN，
+        // 与状态机的递进顺序不一致，直接拿 ordinal 会让看板上的 1 表示"熔断中"而不是"半开"。
+        meterRegistry.gauge("dianping.circuitbreaker.state", tags, breaker,
+                b -> stateCode(b.getState().get()));
+        meterRegistry.gauge("dianping.circuitbreaker.failures", tags, breaker,
+                b -> b.getFailureCount().get());
+        return breaker;
+    }
+
+    private static int stateCode(BreakerState state) {
+        switch (state) {
+            case HALF_OPEN:
+                return 1;
+            case OPEN:
+                return 2;
+            default:
+                return 0;
+        }
+    }
+
+    /**
+     * 状态跃迁计数。光有上面的 state gauge 不够：抓取间隔默认 15s，
+     * 一次完整的 OPEN → HALF_OPEN → CLOSED 抖动可能整个落在两次抓取之间，
+     * 曲线看上去毫无波动。
+     */
+    private void recordTransition(String api, BreakerState from, BreakerState to) {
+        meterRegistry.counter("dianping.circuitbreaker.transition",
+                "api", api, "from", from.name(), "to", to.name()).increment();
     }
 
     /**
@@ -182,8 +235,13 @@ public class CircuitBreakerAspect {
 
     /**
      * 执行降级逻辑
+     *
+     * @param cause open=熔断中直接降级 / probe_in_progress=半开探测名额被占 /
+     *              failure=原方法抛异常后降级。三者对客户端是同一个响应，
+     *              但对定位是完全不同的三件事，必须在指标里分开。
      */
-    private Object doFallback(ProceedingJoinPoint joinPoint, CircuitBreaker cb) throws Throwable {
+    private Object doFallback(ProceedingJoinPoint joinPoint, CircuitBreaker cb, String api, String cause) throws Throwable {
+        meterRegistry.counter("dianping.circuitbreaker.fallback", "api", api, "cause", cause).increment();
         if (!cb.fallback().isEmpty()) {
             return invokeFallback(joinPoint, cb.fallback());
         }

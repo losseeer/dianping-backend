@@ -3,8 +3,11 @@ package com.hmdp.aspect;
 import com.hmdp.annotation.RateLimit;
 import com.hmdp.dto.Result;
 import com.hmdp.utils.RedisRateLimiter;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.reflect.MethodSignature;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
@@ -27,11 +30,17 @@ import static org.mockito.Mockito.when;
  * 这里直接调用 {@code around(joinPoint, annotation)}，不需要 AspectJ 织入：
  * 注解是方法参数，JoinPoint 用 Mockito 造。重点验证「什么情况下会/不会
  * 执行原方法」——这是 4 个线上接口的实际行为契约。
+ *
+ * <p>
+ * 每个分支的 outcome 计数也在这里断言：四个 outcome 对客户端可能长得一样
+ * （rejected 与 unavailable_rejected 都是失败响应），只有指标能把它们分开，
+ * 所以这份断言就是那条区分逻辑的回归网。
  */
 @DisplayName("RateLimitAspect 限流切面")
 class RateLimitAspectTest {
 
     private final RateLimitAspect aspect = new RateLimitAspect();
+    private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
 
     /** 被测注解脱胎于这些方法；Mockito 没法方便地合成注解实例，用反射取真的 */
     @SuppressWarnings("unused")
@@ -66,6 +75,7 @@ class RateLimitAspectTest {
 
         assertEquals("proceeded", aspect.around(jp, annotationOf("plain")));
         verify(jp, times(1)).proceed();
+        assertEquals(1.0, countOf("plain", "allowed"));
     }
 
     // ---------------------------------------------------------------- 被限流
@@ -81,6 +91,7 @@ class RateLimitAspectTest {
         assertFalse(result.getSuccess());
         assertEquals("太频繁了", result.getErrorMsg());
         verify(jp, never()).proceed();
+        assertEquals(1.0, countOf("plain", "rejected"));
     }
 
     @Test
@@ -91,6 +102,7 @@ class RateLimitAspectTest {
 
         assertEquals("降级结果", aspect.around(jp, annotationOf("withFallback")));
         verify(jp, never()).proceed();
+        assertEquals(1.0, countOf("withFallback", "rejected"));
     }
 
     // ---------------------------------------------------------------- Redis 不可用
@@ -103,6 +115,9 @@ class RateLimitAspectTest {
 
         assertEquals("proceeded", aspect.around(jp, annotationOf("plain")));
         verify(jp, times(1)).proceed();
+        // 放行了，但绝不能记成 allowed —— 那是"限流器健康"的意思
+        assertEquals(1.0, countOf("plain", "unavailable_allowed"));
+        assertEquals(0.0, countOf("plain", "allowed"));
     }
 
     @Test
@@ -116,6 +131,9 @@ class RateLimitAspectTest {
         assertFalse(result.getSuccess());
         assertEquals("失败关闭了", result.getErrorMsg());
         verify(jp, never()).proceed();
+        // 响应体与"被限流"完全一样，两者的区别只存在于这个标签里
+        assertEquals(1.0, countOf("failClosed", "unavailable_rejected"));
+        assertEquals(0.0, countOf("failClosed", "rejected"));
     }
 
     // ---------------------------------------------------------------- 配置错误
@@ -141,11 +159,25 @@ class RateLimitAspectTest {
 
     // ---------------------------------------------------------------- 辅助
 
+    @BeforeEach
+    void injectMeterRegistry() {
+        ReflectionTestUtils.setField(aspect, "meterRegistry", meters);
+    }
+
     private void installLimiter(RedisRateLimiter.Outcome outcome) {
         RedisRateLimiter limiter = mock(RedisRateLimiter.class);
         when(limiter.tryAcquire(org.mockito.ArgumentMatchers.anyString(),
                 org.mockito.ArgumentMatchers.anyDouble())).thenReturn(outcome);
         ReflectionTestUtils.setField(aspect, "redisRateLimiter", limiter);
+    }
+
+    /** 某个方法在某条 outcome 分支上被计了几次；该分支没走过时为 0 */
+    private double countOf(String methodName, String outcome) {
+        Counter counter = meters.find("dianping.rate.limit")
+                .tag("api", Fixture.class.getName() + "." + methodName)
+                .tag("outcome", outcome)
+                .counter();
+        return counter == null ? 0.0 : counter.count();
     }
 
     private RateLimit annotationOf(String methodName) throws NoSuchMethodException {

@@ -3,6 +3,7 @@ package com.hmdp.aspect;
 import com.hmdp.annotation.RateLimit;
 import com.hmdp.dto.Result;
 import com.hmdp.utils.RedisRateLimiter;
+import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
@@ -50,6 +51,8 @@ public class RateLimitAspect {
 
     @Resource
     private RedisRateLimiter redisRateLimiter;
+    @Resource
+    private MeterRegistry meterRegistry;
 
     @Around("@annotation(rateLimit)")
     public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit) throws Throwable {
@@ -65,8 +68,12 @@ public class RateLimitAspect {
             throw e;
         }
 
+        // 指标维度与下面的日志分支一一对应，不新增判定：outcome 标签刻意把
+        // "Redis 不可用" 拆成 *_unavailable_allowed / *_unavailable_rejected 两个值
+        // —— 只看拒绝数的话，限流真正生效和 Redis 挂了导致失败关闭会混成同一条曲线。
         switch (outcome) {
             case ALLOWED:
+                count(methodName, "allowed");
                 return joinPoint.proceed();
 
             case REDIS_UNAVAILABLE:
@@ -74,17 +81,28 @@ public class RateLimitAspect {
                 // failOpen=false 时这里的响应体与"被限流"完全一样，
                 // 不区分的话，线上根本分不清是限流生效还是 Redis 挂了。
                 if (rateLimit.failOpen()) {
+                    count(methodName, "unavailable_allowed");
                     log.warn("限流器不可用，按 failOpen 放行: {}", methodName);
                     return joinPoint.proceed();
                 }
+                count(methodName, "unavailable_rejected");
                 log.error("限流器不可用，该接口配置为失败关闭，已拒绝: {}", methodName);
                 return limited(joinPoint, rateLimit);
 
             case REJECTED:
             default:
+                count(methodName, "rejected");
                 log.warn("接口被限流: {} | 当前QPS限制: {}", methodName, rateLimit.qps());
                 return limited(joinPoint, rateLimit);
         }
+    }
+
+    /**
+     * 计数。api 标签直接用限流 key（全限定类名.方法名），与 Redis 里的桶名同源，
+     * 基数等于挂了 @RateLimit 的方法数（当前 4 个），可控。
+     */
+    private void count(String api, String outcome) {
+        meterRegistry.counter("dianping.rate.limit", "api", api, "outcome", outcome).increment();
     }
 
     /**

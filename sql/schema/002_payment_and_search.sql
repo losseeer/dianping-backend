@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS `tb_transaction_outbox` (
     `event_type` VARCHAR(32) NOT NULL,
     `aggregate_id` BIGINT NOT NULL,
     `payload` TEXT NOT NULL,
-    `status` TINYINT NOT NULL DEFAULT 0 COMMENT '0待发送 1已发送 2发送中',
+    `status` TINYINT NOT NULL DEFAULT 0 COMMENT '0待发送 1已发送 2发送中 3死信(重试耗尽,人工改回0可重放)',
     `retry_count` INT NOT NULL DEFAULT 0,
     `next_retry_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `create_time` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,

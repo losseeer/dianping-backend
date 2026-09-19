@@ -42,7 +42,13 @@ public class MvcConfig implements WebMvcConfigurer {
                         "/pay/refund/callback",
                         // 推荐接口：附近热门和全站热门不需要登录
                         "/recommend/hot",
-                        "/recommend/nearby"
+                        "/recommend/nearby",
+                        // 监控抓取端点。Prometheus 拉 /actuator/prometheus 时不会带
+                        // authorization 头，漏加这条白名单的表现是抓取全部 401、
+                        // 而本地用浏览器带着登录态访问却一切正常——极难归因。
+                        // 只放行这一个前缀；具体暴露哪些子端点由
+                        // management.endpoints.web.exposure.include 收紧（见 application.yaml）。
+                        "/actuator/**"
                 ).order(1);
         //token刷新的拦截器
         registry.addInterceptor(new RefreshTokenInterceptor(stringRedisTemplate))
