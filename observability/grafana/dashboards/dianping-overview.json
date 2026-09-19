@@ -1,0 +1,713 @@
+{
+  "uid": "dianping-overview",
+  "title": "点评后端 · 可观测总览",
+  "description": "覆盖 Phase 1 埋的全部指标族。每个面板的 description 写的是口径（分母是什么、什么情况下会误导），不是图表说明。查询语义与 docs/backend-design.md §10.1 保持一致。",
+  "tags": ["dianping", "phase3"],
+  "timezone": "browser",
+  "editable": true,
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "uri",
+        "label": "接口",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+        "query": "label_values(http_server_requests_seconds_count, uri)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": ["All"], "value": ["$__all"] }
+      },
+      {
+        "name": "cache",
+        "label": "缓存",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+        "query": "label_values(dianping_cache_lookup_total, cache)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": { "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "总览",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "秒杀预检 QPS",
+      "description": "Redis + Lua 那一步的总调用速率，不是 HTTP QPS：被限流挡在切面外层的请求不会进这里。",
+      "id": 1,
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(dianping_seckill_precheck_total[$__rate_interval])) or vector(0)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "decimals": 0, "color": { "mode": "thresholds" } },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "秒杀通过率",
+      "description": "reason=ok 占比。掉了不一定有问题：库存售罄时 out_of_stock 会吃掉分母，那是活动正常结束。要和「预检结果分布」一起看。",
+      "id": 2,
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(dianping_seckill_precheck_total{reason=\"ok\"}[$__rate_interval])) / sum(rate(dianping_seckill_precheck_total[$__rate_interval]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.9 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "缓存命中率",
+      "description": "分母是「查缓存次数」而不是请求数：一次 /shop/{id} 可能同时落进 not_cached 与 miss_db_found 两档。null_hit 计入命中（它不查 DB）。",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(dianping_cache_lookup_total{result=~\"hit|hit_plain|null_hit\"}[$__rate_interval])) / sum(rate(dianping_cache_lookup_total[$__rate_interval]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.9 },
+              { "color": "green", "value": 0.95 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "限流失败关闭（5m）",
+      "description": "只统计 unavailable_rejected：Redis 不可用导致限流器自己成了故障点。刻意不统计普通的 rejected —— 压测时几百条拒绝是限流生效，把它做成红色只会训练人对告警色免疫；总量在「限流 outcome by api」面板里看。",
+      "id": 4,
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(dianping_rate_limit_total{outcome=\"unavailable_rejected\"}[5m])) or vector(0)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 1000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "熔断器状态",
+      "description": "所有受保护接口的最高状态。HALF_OPEN(1) 是正常恢复过程，OPEN(2) 才需要有人去看。",
+      "id": 5,
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        { "refId": "A", "expr": "max(dianping_circuitbreaker_state) or vector(0)" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "全部关闭", "color": "green" },
+                "1": { "text": "半开探测", "color": "yellow" },
+                "2": { "text": "熔断中", "color": "red" }
+              }
+            }
+          ],
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "stat",
+      "title": "Outbox 死信（1h）",
+      "description": "重试耗尽的永久失败事件。非 0 就必须有人决定重放还是废弃，它不会自愈。",
+      "id": 6,
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(dianping_outbox_event_total{result=\"dead\"}[1h])) or vector(0)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" }
+    },
+    {
+      "type": "row",
+      "title": "HTTP（服务端视角）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "id": 101,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "QPS by uri",
+      "description": "服务端计数的请求速率。分子分母都不含被 Tomcat 之前拒掉的连接。",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (uri) (rate(http_server_requests_seconds_count[$__rate_interval]))",
+          "legendFormat": "{{uri}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "服务端延迟分位（按接口）",
+      "description": "开了 percentile histogram 才有的数。它和 JMeter 的客户端 P99 是两个数：限流打满时被拒请求在服务端几乎零耗时，突发排队只体现在客户端。两者的差值本身就是限流保护效果的度量。",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"$uri\"}[$__rate_interval])))",
+          "legendFormat": "P50 {{uri}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"$uri\"}[$__rate_interval])))",
+          "legendFormat": "P95 {{uri}}"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\"$uri\"}[$__rate_interval])))",
+          "legendFormat": "P99 {{uri}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "响应状态分布",
+      "description": "status 是 HTTP 状态码，outcome 是 Micrometer 的分类。注意本项目限流与熔断降级返回的都是 200 + Result.fail，所以「业务失败」在这张图上是看不见的 —— 那部分在下面两组自定义指标里。",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status, outcome) (rate(http_server_requests_seconds_count{uri=~\"$uri\"}[$__rate_interval]))",
+          "legendFormat": "{{status}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 30, "lineWidth": 1 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "非 2xx 占比",
+      "description": "用来发现「接口整体挂了」这类事，不能用来判断用户体验：降级路径是 200。排除 /actuator/*：Prometheus 自己每 15s 抓一次指标端点，健康端点在 ES 没起时是 503，这两者会把错误率基线抬成一个和本业务无关的常数。",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - (sum(rate(http_server_requests_seconds_count{status=~\"2..\", uri!~\"/actuator/.*\"}[$__rate_interval])) / clamp_min(sum(rate(http_server_requests_seconds_count{uri!~\"/actuator/.*\"}[$__rate_interval])), 1e-9))",
+          "legendFormat": "非 2xx"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 20, "lineWidth": 1 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "秒杀链路",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 102,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "预检结果分布",
+      "description": "out_of_stock 的爬升速度就是「活动还剩多久」；duplicated 反映的是重试还是刷子；redis_error 对应限流 failOpen=false 之外唯一的整体失败面。",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(dianping_seckill_precheck_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 40, "lineWidth": 1 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "秒杀接口服务端延迟",
+      "description": "uri 用模糊匹配，避免和 Spring 的路径模板写法（{voucherId} 还是 {id}）绑死。这条链路是异步落库的，所以这里的 P99 只覆盖「预检 + 写 Stream」，不代表订单真正落库的延迟 —— 那一段看下面 Outbox 组的等待年龄。",
+      "id": 12,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\".*seckill.*\"}[$__rate_interval])))",
+          "legendFormat": "P99 {{uri}}"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.50, sum by (le, uri) (rate(http_server_requests_seconds_bucket{uri=~\".*seckill.*\"}[$__rate_interval])))",
+          "legendFormat": "P50 {{uri}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 0, "lineWidth": 2 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "限流与熔断",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "id": 103,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "限流 outcome by api",
+      "description": "四个 outcome 必须拆开看：allowed 与 unavailable_allowed（Redis 挂了但 fail-open 放行）对客户端都是正常响应，rejected 与 unavailable_rejected 对客户端是同一个响应体，只有这里能区分「限流生效」和「Redis 挂了导致失败关闭」。",
+      "id": 13,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (api, outcome) (rate(dianping_rate_limit_total[$__rate_interval]))",
+          "legendFormat": "{{api}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "熔断器状态 by api",
+      "description": "0=CLOSED 1=HALF_OPEN 2=OPEN（编码刻意不用枚举 ordinal，见 CircuitBreakerAspect#stateCode）。抓取间隔 15s，一次完整的 OPEN→HALF_OPEN→CLOSED 抖动可能整个落在两次抓取之间 —— 所以要和下面「状态跃迁」一起看。",
+      "id": 14,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "dianping_circuitbreaker_state",
+          "legendFormat": "state {{api}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "max": 2,
+          "custom": {
+            "fillOpacity": 20,
+            "lineWidth": 1,
+            "spanNulls": true,
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "降级原因分布",
+      "description": "cause=open（熔断中直接降级）/ probe_in_progress（半开探测名额被占）/ failure（原方法抛异常后降级）。三者对客户端是同一个响应，但对定位是完全不同的三件事。",
+      "id": 15,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (api, cause) (rate(dianping_circuitbreaker_fallback_total[$__rate_interval]))",
+          "legendFormat": "{{api}} {{cause}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 40 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "滑动窗口内失败数",
+      "description": "gauge，不是累计数：窗口过期会清零，所以它阶梯状是正常的。它到 openFailureThreshold 的 times 就是熔断触发点。",
+      "id": 16,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "dianping_circuitbreaker_failures",
+          "legendFormat": "{{api}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 20, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "熔断状态跃迁",
+      "description": "to=OPEN 的速率就是「有几件事正在坏」；to=CLOSED 是恢复。用 counter 而不是 state gauge，正是为了抓住 15s 采样之间的抖动。",
+      "id": 17,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (api, from, to) (increase(dianping_circuitbreaker_transition_total[$__rate_interval]))",
+          "legendFormat": "{{api}} {{from}}→{{to}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 20, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "缓存",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "id": 104,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "查缓存结果分布",
+      "description": "hit 与 hit_plain 都是命中，区别在值格式：前者是逻辑过期信封 RedisData（预热写入），后者是 queryWithPassThrough 回填的裸 JSON + 物理 TTL。两种策略共用同一个 key，hit_plain 持续走高就说明热点 key 实际靠物理过期在撑、预热没到位（Phase 2 之前这里会 NPE 降级成 DB 查询）。",
+      "id": 18,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(dianping_cache_lookup_total{cache=~\"$cache\"}[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "stacking": { "mode": "normal" }, "fillOpacity": 40, "lineWidth": 1 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "命中率 by cache",
+      "description": "按缓存前缀拆开，判断「整体命中率正常但某个 key 已经失效」这类情况。",
+      "id": 19,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cache) (rate(dianping_cache_lookup_total{cache=~\"$cache\", result=~\"hit|hit_plain|null_hit\"}[$__rate_interval])) / clamp_min(sum by (cache) (rate(dianping_cache_lookup_total{cache=~\"$cache\"}[$__rate_interval])), 1e-9)",
+          "legendFormat": "{{cache}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": { "fillOpacity": 10, "lineWidth": 2 }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "重建尝试",
+      "description": "claimed=抢到锁 / skipped=锁被占（热点 key 过期瞬间只有一个赢家，正常）/ failed=重建任务抛异常。failed 与 stale_served 对着看才定位得准。",
+      "id": 20,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(dianping_cache_rebuild_total[$__rate_interval]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 20, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "重建线程池",
+      "description": "逻辑过期重建用的自建线程池（ExecutorServiceMetrics 注册）。queued 长期不为 0 = 重建速度跟不上失效速度，用户就会持续读到 stale_served。",
+      "id": 21,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "executor_queued_tasks{name=\"cache-rebuild\"}",
+          "legendFormat": "排队任务"
+        },
+        {
+          "refId": "B",
+          "expr": "executor_active_threads{name=\"cache-rebuild\"}",
+          "legendFormat": "活跃线程"
+        },
+        {
+          "refId": "C",
+          "expr": "rate(executor_completed_tasks_total{name=\"cache-rebuild\"}[$__rate_interval])",
+          "legendFormat": "完成速率"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 10, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "row",
+      "title": "Outbox（事务性发件箱）",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "id": 105,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "投递结果 by type",
+      "description": "sent / failed（还会重试）/ dead（永久失败）/ claim_lost（多实例 CAS 抢不到，正常）。type 取自库里的 eventType：PAY_NOTIFY、REFUND、REDIS_COMPENSATION。",
+      "id": 22,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (type, result) (rate(dianping_outbox_event_total[$__rate_interval]))",
+          "legendFormat": "{{type}} {{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "fillOpacity": 10, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "待发事件数（上一轮快照）",
+      "description": "读的是内存快照，上限 BATCH_LIMIT=50，所以它「贴着 50」= 投递速度追不上写入速度，而不是「只有 50 条不严重」。不写回 DB 查询是刻意的：抓取比业务先倒下就更糟。",
+      "id": 23,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "dianping_outbox_pending",
+          "legendFormat": "pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 30, "lineWidth": 1, "thresholdsStyle": { "mode": "line" } },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "最老事件等待年龄",
+      "description": "条数看不出的东西都在这里：堆积 50 条以内曲线是平的，但最老一条可能已经等了很久 —— 那才是用户可感知的通知延迟。空批时为 0。",
+      "id": 24,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 75 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        { "refId": "A", "expr": "dianping_outbox_oldest_age_seconds", "legendFormat": "oldest age" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 30, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "距上次扫描",
+      "description": "扫描间隔 1s。持续接近抓取间隔（15s）说明抓取本身在漂；这个数一直涨而 pending 也涨，说明调度线程根本没在跑（@Scheduled 与 ES/Redis 补偿共用调度池），只看 pending 分不出来。",
+      "id": 25,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 75 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        { "refId": "A", "expr": "dianping_outbox_last_scan_age_seconds", "legendFormat": "since scan" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "fillOpacity": 30, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "卡死事件回收",
+      "description": "每回收一条 = 有实例在「已抢占、未投递」之间死掉过。偶发正常（发布重启），持续出现就是实例被强杀或发送卡死超 1 分钟。",
+      "id": 26,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 75 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(dianping_outbox_stuck_recovered_total[$__rate_interval])",
+          "legendFormat": "recovered"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "fillOpacity": 30, "lineWidth": 1 } },
+        "overrides": []
+      }
+    }
+  ]
+}

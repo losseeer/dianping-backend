@@ -79,7 +79,9 @@ management:
         # /actuator/prometheus 里；只有开了 histogram 才会导出
         # http_server_requests_seconds_bucket，Prometheus 侧才能用
         # histogram_quantile() 算服务端 P99——这是替代"Postman 手跑 200 次"
-        # 的前提。代价是每个 bucket 一条时间序列，桶数固定（约 11 个）不随基数增长。
+        # 的前提。代价是每个 bucket 一条时间序列：实测 Micrometer 默认导出 69 个
+        # le 桶（0.001s ~ 30s 的几何递增 + +Inf），桶数固定不随基数增长，
+        # 但会随 (uri, method, status, outcome, exception) 的组合数线性放大。
         http.server.requests: true
 payment:
   # Public callbacks remain disabled until this environment variable is configured.

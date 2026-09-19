@@ -10,7 +10,7 @@
 | 存储 | MySQL 8（唯一约束兜底 + 条件更新乐观锁）/ Redis（缓存 / 锁 / 全局 ID / Stream） |
 | 消息 | RabbitMQ（延迟队列 / 通知 / Outbox 发布）/ Redis Stream（秒杀异步落库） |
 | 搜索 | Elasticsearch（IK 分词 + synonym_graph 同义词扩展） |
-| 可观测 | Micrometer + Prometheus 端点（缓存命中 / 限流判定 / 熔断状态跃迁 / Outbox 积压 / 服务端 P99 直方图）；MDC traceId 贯通 HTTP → Stream → MQ → 线程池 |
+| 可观测 | Micrometer + Prometheus 端点（缓存命中 / 限流判定 / 熔断状态跃迁 / Outbox 积压 / 服务端 P99 直方图）；MDC traceId 贯通 HTTP → Stream → MQ → 线程池；本地采集栈 `observability/`（Prometheus + Grafana，含 7 条告警规则） |
 | 压测 | JMeter（`stress/` 含场景脚本、数据准备与校验脚本） |
 
 ## 核心设计
@@ -35,6 +35,9 @@ mysql -u root -p dingping < sql/data/001_test_data.sql   # 120 商铺 + 1005 用
 
 # 3. 启动（JDK 8）
 mvn spring-boot:run   # 默认端口 8081
+
+# 4.（可选）起本地观测栈：Prometheus :9090 + Grafana :3000，抓 :8081/actuator/prometheus
+cd observability && docker compose up -d
 ```
 
 详细部署与排障见 `docs/SETUP.md`，压测方法与结论见 `docs/perf-report.md`。
@@ -46,6 +49,7 @@ mvn spring-boot:run   # 默认端口 8081
 | `docs/SETUP.md` | 环境搭建与部署手册 |
 | `docs/backend-design.md` | 后端设计说明 |
 | `docs/perf-report.md` | 秒杀链路四阶段压测报告 |
+| `observability/README.md` | 本地观测栈：Prometheus 抓取配置、Grafana 面板与告警规则口径 |
 | `docs/tech-transfer.md` | 可迁移工程模式与落地指南 |
 | `docs/orginal_README.md` | 原始项目说明 |
 

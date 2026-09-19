@@ -21,6 +21,11 @@
 #
 # 默认非破坏性：只改 tb_seckill_voucher 的 stock/时间窗 + 删 Redis 秒杀键
 #              （缓存会被 ensureRedisStock 自动重建），不删任何订单数据
+#
+# --reset-orders 是破坏性的，会做两件事：
+#   1) 删除该券全部历史订单
+#   2) 清空 order.delay.queue / order.cancel.queue
+#      （否则在途的延迟消息 30 分钟后到期，会持续打「订单不存在」WARN）
 # ==============================================================================
 set -e
 
@@ -39,6 +44,9 @@ USER_COUNT=${POSITIONAL[1]:-1000}
 STOCK=${POSITIONAL[2]:-500}
 DB="dingping"
 MYSQL="mysql -uroot ${DB}"
+# 与 QueueConfig.java 保持一致
+ORDER_DELAY_QUEUE="order.delay.queue"
+ORDER_CANCEL_QUEUE="order.cancel.queue"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOKENS_CSV="${SCRIPT_DIR}/tokens.csv"
 
@@ -58,6 +66,30 @@ if [ "${RESET_ORDERS}" -eq 1 ]; then
   BEFORE=$(${MYSQL} -N -e "SELECT COUNT(*) FROM tb_voucher_order WHERE voucher_id=${VOUCHER_ID};" | tr -d ' ')
   ${MYSQL} -e "DELETE FROM tb_voucher_order WHERE voucher_id=${VOUCHER_ID};"
   echo "已删除该券历史订单 ${BEFORE} 条"
+
+  # 【为什么删订单还必须清延迟队列】
+  # 延迟消息是【落库成功后】才发的（SeckillVoucherListener 的 else 分支），
+  # 即入队时订单确实存在。删掉订单**删不掉已经躺在 MQ 里的消息** ——
+  # 它们照常 30 分钟后到期，回调发现订单没了，于是每条打一句：
+  #     WARN 超时取消失败，订单不存在: orderId=xxx
+  # 代码里本来有 pending 缓存兜底，但那个 TTL 只有 10 分钟，够不着 30 分钟
+  # 后才到的消息。所以不清队列的话，重置完会有持续半小时的 WARN 风暴。
+  # 注意：rabbitmqctl 缺失或 RabbitMQ 没起时不应中断脚本，只告警。
+  if command -v rabbitmqctl > /dev/null 2>&1; then
+    # 一次性取所有队列的消息数（rabbitmqctl 每次调用约 1-2 秒，别放进循环）
+    QUEUE_SNAPSHOT=$(rabbitmqctl list_queues name messages 2>/dev/null)
+    for Q in "${ORDER_DELAY_QUEUE}" "${ORDER_CANCEL_QUEUE}"; do
+      MSGS=$(echo "${QUEUE_SNAPSHOT}" | awk -v q="${Q}" '$1==q {print $2}')
+      if rabbitmqctl purge_queue "${Q}" > /dev/null 2>&1; then
+        echo "已清空延迟/死信队列 ${Q}（原有 ${MSGS:-?} 条在途消息）"
+      else
+        echo "WARN: 清空队列 ${Q} 失败，稍后可能有超时取消回调打「订单不存在」WARN"
+      fi
+    done
+  else
+    echo "WARN: 未找到 rabbitmqctl，跳过清理延迟队列"
+    echo "      若出现「超时取消失败，订单不存在」WARN，属预期（在途消息定时到了）"
+  fi
 else
   LEFT=$(${MYSQL} -N -e "SELECT COUNT(*) FROM tb_voucher_order WHERE voucher_id=${VOUCHER_ID};" | tr -d ' ')
   if [ "${LEFT}" -gt 0 ]; then

@@ -743,21 +743,27 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 
 指标出口：`GET /actuator/prometheus`（Micrometer + Prometheus 文本格式，无需登录，见 `MvcConfig` 白名单）。
 
+采集与看板在 `observability/`：`docker compose up -d` 起 Prometheus（127.0.0.1:9090）+ Grafana（127.0.0.1:3000，目录「点评后端」，面板 uid `dianping-overview`）。JSON 里的每条查询、`prometheus/alerts/dianping.yml` 里的 7 条告警规则，与下表是同一套口径，改这里要同步改那里。
+
 | 指标 | 估算区间 | 测试方法 |
 |---|---|---|
-| 秒杀 QPS | 4000-6000 | JMeter `seckill.jmx`；服务端对照 `sum(rate(dianping_seckill_precheck_total[1m]))` |
-| 秒杀 P99 延迟 | 150-250ms | JMeter 聚合报告 99% Line（客户端视角）；服务端 `histogram_quantile(0.99, http_server_requests_seconds_bucket)` |
+| 秒杀 QPS | 4000-6000 | JMeter `seckill.jmx`；服务端对照 `sum(rate(dianping_seckill_precheck_total[$__rate_interval]))` |
+| 秒杀 P99 延迟 | 150-250ms | JMeter 聚合报告 99% Line（客户端视角）；服务端 `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/voucher-order/seckill/{id}"}[$__rate_interval])))` |
 | 商铺详情缓存命中率 | 95%-98.5% | `sum(rate(dianping_cache_lookup_total{result=~"hit\|hit_plain\|null_hit"}[5m])) / sum(rate(dianping_cache_lookup_total[5m]))` |
-| ES 搜索 P95 延迟 | 30-80ms | `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/shop/search"}[1m])))` |
+| ES 搜索 P95 延迟 | 30-80ms | `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/shop/search"}[$__rate_interval])))` |
 | 同义词召回率提升 | 2-5× | 人工构造 20 个同义 query 看返回交集并集 |
+
+> 表里的 `uri` 标签值是实测的 Spring 路径模板（`/voucher-order/seckill/{id}`、`/shop/{id}`），不是猜的 —— 这一层写错，面板只会安静地空着。`observability/check-queries.py` 就是拿一份真实抓取的文本去核对 JSON 里所有指标名与标签的，起栈之前先跑它。
 
 **口径说明**（比数值更容易读错，写在指标旁边）：
 
-- `http_server_requests` 开了 percentile histogram，所以服务端 P99 与 JMeter 的客户端 P99 是**两个数**。限流打满时前者明显低于后者：被拒请求在服务端几乎零耗时，突发排队体现在客户端。以前只有 `result.jtl` 一个数，现在两者的差值本身就是限流保护效果的度量。
+- `http_server_requests` 开了 percentile histogram（实测导出 69 个 `le` 桶），所以服务端 P99 与 JMeter 的客户端 P99 是**两个数**。限流打满时前者明显低于后者：被拒请求在服务端几乎零耗时，突发排队体现在客户端。以前只有 `result.jtl` 一个数，现在两者的差值本身就是限流保护效果的度量。
 - 一次 `/shop/{id}` 请求可能落进两个档：`not_cached`（逻辑过期查不到）+ `miss_db_found`（兜底走穿透回填），因此命中率分母是**查缓存次数**而不是请求数；`null_hit` 计入命中（它不查 DB）。
 - `hit` 与 `hit_plain` 都是命中，区别在值格式：前者是逻辑过期信封 `RedisData`（预热写入），后者是 `queryWithPassThrough` 回填的裸 JSON + 物理 TTL。两种策略共用同一个 key，`hit_plain` 持续走高就说明热点 key 实际靠物理过期在撑、预热没到位。
 - Outbox 死信看 `increase(dianping_outbox_event_total{result="dead"}[1h])`：出现即说明有事件重试耗尽（永久失败，例如补偿目标已不存在），需要人工决定重放还是废弃；`dianping_outbox_stuck_recovered_total` 则对应"实例在已抢占未投递之间死掉过"。
 - 熔断器与限流的 outcome 是**必拆的**：`rejected` 与 `unavailable_rejected` 对客户端是同一个响应体，只有指标能区分"限流生效"和"Redis 挂了导致失败关闭"。
+- **所有 `dianping_*` 指标都是懒注册的**：没走过的代码路径不会有序列，面板上的 No data 不等于 0。同理，被 `@RateLimit` 挡在切面外层的请求不会进 `dianping_seckill_precheck_total`，所以"预检 QPS"永远 ≤ 接口 QPS，两者的差就是限流拦掉的那部分。
+- **异步落库收敛时间仍测不出来**：秒杀走 Redis Stream，消费端没有埋耗时指标，"500 单约 4 秒落库"这类数只能轮询 DB（`stress/verify.sh`）。这是当前观测面的一个真实缺口 —— 想补就给它加一个 `Timer`，别再靠日志时间戳相减。
 
 ### 10.2 横向扩展预留
 
@@ -824,7 +830,8 @@ grep 'my-debug-01' app.log      # HTTP 线程 + seckill-order-consumer + MQ 容�
 5. **支付风控**：接入第三方风控（设备指纹、行为分析），PaymentService.payOrder 前置风控检查
 6. **秒杀预热**：秒杀活动开始前把库存预热到 Redis，避免活动开始瞬间 DB 压力
 7. **接口幂等 token**：秒杀接口前置 `GET /voucher-order/token` 获取幂等 token，提交时校验，防重复提交
-8. **链路追踪**：指标出口（`/actuator/prometheus`，§10.1）与单机 traceId 贯通（§10.3）已落地，覆盖 HTTP / Redis Stream / RabbitMQ / 线程池 / `@Scheduled` 五类切换点。剩下的都是"跨进程"那一档：① Agent 微服务是这套接口的调用方，它只要在请求里带上 `X-Trace-Id`，两边日志就能并到一条链上——机制在本仓库已经就绪，缺的是 Agent 侧那段改动的约定；② 采样、拓扑图、按服务聚合的 P99 需要 SkyWalking / Jaeger 这类专门组件，单靠 MDC 不再往上加
+8. **链路追踪**：指标出口（`/actuator/prometheus`，§10.1）、本地采集栈（`observability/`：Prometheus + Grafana 面板 + 7 条告警规则）与单机 traceId 贯通（§10.3）已落地，切换点覆盖 HTTP / Redis Stream / RabbitMQ / 线程池 / `@Scheduled` 五类。剩下的都是"跨进程"那一档：① Agent 微服务是这套接口的调用方，它只要在请求里带上 `X-Trace-Id`，两边日志就能并到一条链上——机制在本仓库已经就绪，缺的是 Agent 侧那段改动的约定；② 采样、拓扑图、按服务聚合的 P99 需要 SkyWalking / Jaeger 这类专门组件，单靠 MDC 不再往上加
+9. **秒杀落库耗时指标**：`dianping_seckill_precheck_total` 只计到"预检放行"，Stream 消费端没有埋耗时，所以"500 单约 4 秒落库"这个数至今只能靠轮询 DB 得到（`stress/verify.sh`）。补法是在 `SeckillVoucherListener` 上挂一个 `Timer`，并用消息里已有的 `createEpoch` 字段单独计"预订单在 Stream 里等了多久"——后者才是用户真正感知的延迟。这是当前观测面最大的一个缺口
 
 ---
 

@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: dianping
+    # 用 folder 标题而不是 folderUid：文件提供器不会创建 UID 引用的目录，
+    # 指了一个不存在的 folderUid 会让面板静默落在 General 里
+    folder: 点评后端
+    type: file
+    # 改完 JSON 等 30 秒即可生效，不用重启容器（UI 上的改动会被文件覆盖，
+    # 所以调完面板记得把 JSON 拷回仓库 —— README 里有导出命令）
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

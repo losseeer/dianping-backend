@@ -8,6 +8,8 @@
 
 > **实现变更（2026-09-17）**：限流器已从 Guava RateLimiter（JVM 进程内单机令牌桶）改为 **Redis + Lua 分布式令牌桶**，因为前者部署 N 个实例时阈值会放大 N 倍、且实例重启后桶是满的。下方 2026-08-20 的数据是**当时 Guava 实现**下的实测记录，保留原样不改写；新实现下的复测见文末 [场景 A′](#场景a2026-09-17redis-分布式令牌桶复测)。
 
+> **测法变更（2026-09-19）**：本报告此前的每个 QPS / 延迟都来自**客户端**计数（JMeter 聚合报告、ab 的 Time taken 行）。服务端侧现在有一套同名指标可以直接查（`observability/` 起栈，`docs/backend-design.md` §10.1 定口径）。下方历史数字**按当时的测法原样保留**，不改写成 PromQL 数值；怎么用指标复测这些结论见 [用 Prometheus 复测](#用-prometheus-复测)。
+
 - 测试时间: **2026-08-20 10:37 - 10:47**
 - 环境: **localhost / Spring Boot 8081 / macOS**
 - 数据量: **1,000 测试用户 / 秒杀券 ID=105 / 初始库存 500**
@@ -29,7 +31,7 @@
 
 ## 测试方法
 
-压测脚本 `stress_1000.py` 四阶段流程：
+压测脚本 `stress_1000.py` 四阶段流程（当前脚手架为 `stress/prepare.sh` + `seckill.jmx` + `verify.sh`，阶段划分一致）：
 
 1. **prepare**：重置 DB 库存（500）与订单表，清理 Redis 库存键、订单 Set、Stream 与 pending 队列
 2. **inject**：从 DB 取 1,000 个用户，直接写 Redis Hash 会话（绕过登录接口 QPS=5 限流），TTL 10h
@@ -37,6 +39,8 @@
 4. **verify**：轮询 DB 订单数直至收敛（连续 3 秒不变），对账库存 / 订单数 / 买家去重数 / Redis 一致性
 
 响应分类：`ok`（下单成功）/ `limited`（限流拒绝）/ `soldout`（库存不足）/ `dup`（重复下单）/ `error`。
+
+> 第 3 步之前建议再起观测栈（`cd observability && docker compose up -d`），压测窗口内的服务端指标就会被抓下来。它**不替代**第 4 步的对账 —— 指标只回答"系统当时在做什么"，对账回答"结果对不对"，后者仍然只能靠查库。
 
 ## 场景A：限流保护验证（@RateLimit qps=50）
 
@@ -167,6 +171,49 @@ ab -n 3000 -c 1000 -k \
 - **定位**：换 ab（C 实现）后同一接口打到 6,579 QPS
 - **启示**：压测结论必须先排除压测端瓶颈，否则会严重低估服务端能力（本例差 7.3 倍）
 
+## 用 Prometheus 复测
+
+上面这些数全部是**客户端**视角：JMeter 的聚合报告、ab 的 `Time taken` 行。它们的共同问题是把"服务端处理一次请求要多久"和"1,000 条连接在操作系统队列里排了多久"混成了一个数 —— 瓶颈分析那一节的三轮优化，本质上就是在手工剥离这层混合。
+
+现在服务端自己会报数。起栈：
+
+```bash
+mvn spring-boot:run                        # 终端 A
+cd observability && docker compose up -d   # 终端 B → http://127.0.0.1:9090 / :3000
+```
+
+### 报告里每个数的服务端复算方式
+
+| 报告中的数 | 复算查询 | 和客户端数的关系 |
+|---|---|---|
+| 成功下单 110 / 500 | `sum(increase(dianping_seckill_precheck_total{reason="ok"}[<压测窗口>]))` | 应当**等于**客户端 `ok` 计数；不等就说明有请求没走到 Lua 预检（十有八九是被限流挡在切面层） |
+| 被限流拒绝 890 / 936 | `sum(increase(dianping_rate_limit_total{api="com.hmdp.controller.VoucherOrderController.seckillVoucher",outcome="rejected"}[<窗口>]))` | 等价。多出来的价值是 `outcome` 能把"限流生效"和"Redis 挂了导致失败关闭"分开（见下） |
+| 实际放行速率 ≈46 QPS | `sum(rate(dianping_seckill_precheck_total[30s]))` | 等价，且不用手工做"110 单 ÷ 2.38 秒"这种事后除法 |
+| QPS（含拒绝）420.7 | `sum(rate(http_server_requests_seconds_count{uri="/voucher-order/seckill/{id}"}[30s]))` | 等价（这是接口层面的总请求速率，不分结果） |
+| P99 2,263.75 ms（场景A）/ 466 ms（A′） | `histogram_quantile(0.99, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/voucher-order/seckill/{id}"}[1m])))` | **必然显著低于客户端 P99**。被拒请求在服务端几乎零耗时，突发排队发生在客户端与 Tomcat 之间。这两个数的差值本身就是限流保护效果的度量，以前只有一个混合数 |
+| 500 soldout | `sum(increase(dianping_seckill_precheck_total{reason="out_of_stock"}[<窗口>]))` | 等价。顺带解释 ab 那个 `Failed requests: 2999`：成功与售罄的响应体长度不同，ab 把长度差异记为失败 |
+| 真实吞吐 6,579 / 7,158 QPS | 同"QPS（含拒绝）"，看压测窗口的峰值区间（把面板时间范围拉到那 3 秒，或用 `[10s]`） | 这是**服务端**吞吐，不再受压测客户端实现语言影响；ab 那轮"Python 客户端只能打 903"的干扰被彻底排除 |
+| 缓存命中率 95%-98.5% | `sum(rate(dianping_cache_lookup_total{result=~"hit\|hit_plain\|null_hit"}[5m])) / sum(rate(dianping_cache_lookup_total[5m]))` | 以前只能事后翻日志估。注意分母是**查缓存次数**，一次请求可能同时贡献 `not_cached` 与 `miss_db_found` 两档 |
+| ES 搜索 P95 30-80ms | `histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/shop/search"}[1m])))` | 等价，且能在 ES 挂掉时立刻从 `dianping_circuitbreaker_state==2` 看出降级正在发生 |
+
+> 表里的 `uri` / `api` 标签值是实测出来的（`/voucher-order/seckill/{id}` 用的是 `{id}` 而不是 `{voucherId}`；`api` 是全限定方法名，和 Redis 里的令牌桶 key 同源）。拿一份真实抓取跑 `observability/check-queries.py` 就能核对，别照抄。
+
+### 复测清单
+
+1. `cd stress && ./prepare.sh 105 1000 500 --reset-orders` —— 拿到干净的库存与守恒基线
+2. 起观测栈，确认 Prometheus `/targets` 是 UP（**它必须在压测之前起**：counter 从进程启动才开始计，晚了就只能事后翻日志）
+3. `jmeter -n -t seckill.jmx -l result.jtl -e -o ./report`
+4. 跑 `verify.sh` 对账 —— **这一步没有被指标取代**，见下面"指标回答不了的"
+5. Grafana 打开 `点评后端 · 可观测总览`，把时间范围对齐压测窗口，逐面板核对上表
+6. 压测窗口结束后：`docker compose down`（不带 `-v`，保留这轮的时序数据以便下次对比）
+
+### 指标回答不了的（别用错工具）
+
+- **正确性断言不在指标里**。零超卖、一人一单、Redis 与 DB 库存一致，这三项靠的是 `verify.sh` 的守恒等式。指标是聚合计数，"售出 500 + 库存剩 0"和"售出 500 + 库存剩 3"在它身上可能长得一模一样。
+- **异步落库收敛时间还是测不出来**。秒杀走 Redis Stream，消费端没有埋耗时指标，"500 单约 4 秒落库"只能继续轮询 DB。想补就在 `SeckillVoucherListener` 上加一个 `Timer`（顺带把 `createEpoch` 字段的等待时长也测出来 —— 那个才是用户真正感知的延迟），这是当前观测面已知最大的一个缺口。
+- **跨实例聚合**。counter 在进程重启后归零，多实例部署时按 `instance` 拆开看再 `sum`；本地单实例无所谓，但别把本地复测的查询直接搬去生产。
+- **`unavailable_rejected` 出现即环境异常**。场景 A′ 那类"限流是否符合预期"的结论，只有在这一项为 0 的前提下才成立：Redis 不可用时的失败关闭对客户端是**同一个响应体**，看 JMeter 的聚合报告根本分不出来。`observability/prometheus/alerts/dianping.yml` 里对应一条 critical 规则。
+
 ## 性能指标汇总
 
 | 场景 | 配置 | QPS | 平均延迟 | P50 | P90 | P95 | P99 | 结果 |
@@ -256,6 +303,7 @@ ab -n 3000 -c 1000 -k \
 4. 测试数据: 1,000 用户（Redis 会话注入）, 秒杀券 ID=105, 初始库存 500
 5. 压测脚本: stress_1000.py（prepare / inject / run / verify 四阶段）
 6. 压测后已复原: `@RateLimit qps=50` 恢复、HikariCP 临时配置移除、测试数据清理、后端重启重建 Stream 消费组
+7. 观测栈（**2026-09-19 才引入**，上面两轮数据都早于它，因此全部是客户端视角的数）: `observability/docker-compose.yml` → Prometheus 抓 `:8081/actuator/prometheus`，Grafana 面板 uid `dianping-overview`。下一轮复测起它，就能同时拿到客户端与服务端两套数。
 
 ### 场景 A′（2026-09-17）补充
 

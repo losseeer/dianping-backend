@@ -1,0 +1,14 @@
+apiVersion: 1
+
+datasources:
+  - name: dianping-prometheus
+    # 固定 uid：面板 JSON 按 uid 引用数据源，改名不会让面板失联
+    uid: dianping-prom
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      # 与 prometheus.yml 的 scrape_interval 对齐；Grafana 据此推 $__rate_interval 的下限
+      timeInterval: "15s"

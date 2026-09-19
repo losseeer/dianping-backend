@@ -1,0 +1,77 @@
+# 阈值都直接来自 docs/backend-design.md §10.1 里写下的口径判断，不是新发明的规则。
+# 没有接 Alertmanager（见 prometheus.yml 的 alerting 段），所以这里的"告警"= Prometheus
+# /alerts 页面变红 + Grafana 面板阈值线，不含推送。
+
+groups:
+  - name: dianping-outbox
+    rules:
+      - alert: OutboxDeadLetterAppeared
+        # 重试耗尽 = 永久失败，只能人工决定重放还是废弃；它不会自愈，所以出现一条就该有人知道
+        expr: increase(dianping_outbox_event_total{result="dead"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox 出现死信（1h 内 {{ $value | printf \"%.0f\" }} 条）"
+          description: "type={{ $labels.type }}。事件重试耗尽，补偿不会再自动发生。查库里的 message_id 与失败原因后决定重放或废弃。"
+
+      - alert: OutboxBacklogAging
+        # 只看条数不够：BATCH_LIMIT=50，堆积 50 条以内曲线是平的，但最老一条已经等了多久才是用户可感知的延迟
+        expr: dianping_outbox_oldest_age_seconds > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Outbox 最老事件已等待 {{ $value | printf \"%.0f\" }} 秒"
+
+      - alert: OutboxPublisherStalled
+        # 扫描间隔 1s，这个 gauge 超过 30s 说明 @Scheduled 那条线程根本没在跑
+        # （调度池被 ES/Redis 补偿任务占死）。单看 pending 分不出来。
+        expr: dianping_outbox_last_scan_age_seconds > 30
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Outbox 投递任务停止扫描（上次扫描距今 {{ $value | printf \"%.0f\" }} 秒）"
+
+      - alert: OutboxStuckRecoveredRepeatedly
+        # 偶发正常（发布重启）；持续出现说明实例在"已抢占未投递"之间被强杀，或发送卡死超 1 分钟
+        expr: increase(dianping_outbox_stuck_recovered_total[15m]) > 5
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "15 分钟内回收了 {{ $value | printf \"%.0f\" }} 条卡在发送中的事件"
+
+  - name: dianping-protection
+    rules:
+      - alert: CircuitBreakerOpen
+        # state 编码：0=CLOSED 1=HALF_OPEN 2=OPEN（刻意不用 ordinal()，见 CircuitBreakerAspect#stateCode）
+        expr: dianping_circuitbreaker_state == 2
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "接口 {{ $labels.api }} 熔断中"
+
+      - alert: RateLimitFailClosed
+        # rejected 是限流生效（预期行为，不该报警）；unavailable_rejected 是 Redis 不可用导致的失败关闭
+        # —— 对客户端是同一个响应体，只有指标能区分这两个世界
+        expr: increase(dianping_rate_limit_total{outcome="unavailable_rejected"}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.api }} 因限流器不可用而拒绝请求"
+
+      - alert: CacheHitRateDropped
+        # 分母是"查缓存次数"而不是请求数：一次请求可能同时落进 not_cached 与 miss_db_found 两档
+        expr: |
+          sum(rate(dianping_cache_lookup_total{result=~"hit|hit_plain|null_hit"}[5m]))
+            / sum(rate(dianping_cache_lookup_total[5m])) < 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "缓存命中率跌至 {{ $value | humanizePercentage }}（10 分钟窗口）"
+          description: "hit_plain 占比高 = 热点 key 实际靠物理过期在撑、逻辑过期预热没到位；not_cached + miss_db_found 占比高 = 缓存根本是空的，DB 在被直接打。"

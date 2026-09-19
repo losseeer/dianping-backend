@@ -1,0 +1,49 @@
+# 本地一键起 Prometheus + Grafana，抓本仓库 :8081/actuator/prometheus。
+# 起法见同目录 README.md。
+services:
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    container_name: dianping-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # 只跑 7 天：这是一台本地开发机的观测栈，不是长期时序库。
+      # 压测报告要留数的话在跑之前把 retention 调大，或者跑完立刻导出。
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Linux 上没有 Docker Desktop 那层内置解析，必须显式映射，否则抓不到宿主上的应用
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    container_name: dianping-grafana
+    environment:
+      # 本地观测栈的默认口令，不是密钥：需要时用环境变量覆盖（见 README 的启动命令）。
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  # 用 named volume 而不是 ./data：时序数据不该掉进 git 工作区
+  prometheus-data:
+  grafana-data:
