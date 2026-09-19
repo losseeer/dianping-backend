@@ -9,6 +9,7 @@ import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.TransactionOutboxMapper;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.ConfirmedRabbitPublisher;
+import com.hmdp.utils.TraceContext;
 import io.micrometer.core.instrument.MeterRegistry;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -163,6 +164,19 @@ public class TransactionOutboxPublisher {
     }
 
     private void publish(TransactionOutbox event) {
+        // 【链路追踪】@Scheduled 线程没有上游请求可接，所以每条事件起一个自己的 id：
+        // 这条事件在本次投递里的所有日志（发送/标记/失败原因）共用它，消费者那端还能靠消息头续上。
+        //
+        // 【为什么这一跳不接原始 traceId】写事件的是业务线程、投递的是扫描线程，中间隔了一次落表，
+        // 而表里没有 trace 列（加列要走 DDL，项目目前没有迁移工具）。要硬接只能在两端各打一行带
+        // outbox id 的日志去对，等于给这条链路凭空加一倍日志量。跨这一跳请直接用 payload 里的
+        // orderId / tradeNo grep —— 那本来就是业务主键，比 traceId 更好用。
+        try (TraceContext.Scope ignored = TraceContext.enter()) {
+            doPublish(event);
+        }
+    }
+
+    private void doPublish(TransactionOutbox event) {
         try {
             if (REDIS_COMPENSATION.equals(event.getEventType())) {
                 VoucherOrder order = JSONUtil.toBean(event.getPayload(), VoucherOrder.class);

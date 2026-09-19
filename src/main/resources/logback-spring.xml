@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  日志格式：在 Spring Boot 默认控制台格式里插一个 [%X{traceId}]。
+
+  【为什么要自己写 logback-spring.xml】可观测性 Phase 1 有了指标（哪类请求在变慢），
+  指标只能定位到"接口 + 结果"这一层；下一步要看"这一次请求到底卡在哪一步"，
+  靠的就是用同一个 traceId 把这个请求跨线程的日志行捞出来。格式不统一，捞不出来。
+
+  【写法说明】CONSOLE_LOG_PATTERN 必须在 include defaults.xml 之前定义：
+  defaults.xml 里是 ${CONSOLE_LOG_PATTERN:-默认值} 的兜底写法，先定义好的值才会被保留。
+  这样 %clr、%wEx 这些 Boot 内置转换器照常可用，颜色和本地阅读体验不变。
+
+  【logging.level.* 仍然生效】yaml 里的 logging.level.com.hmdp 由 Boot 在容器启动后
+  套到 LoggerContext 上，自定义配置不会让它失效。
+
+  【no-trace 是刻意留的】没有 traceId 的线程（Tomcat 接收线程、Hikari 维护线程、
+  Redisson netty）显示 no-trace，一眼能区分"这条日志不属于任何请求"和"链路断了"。
+-->
+<configuration>
+    <property name="CONSOLE_LOG_PATTERN"
+              value="%clr(%d{${LOG_DATEFORMAT_PATTERN:-yyyy-MM-dd HH:mm:ss.SSS}}){faint} %clr(${LOG_LEVEL_PATTERN:-%5p}) %clr(${PID:- }){magenta} %clr(---){faint} %clr([%15.15t]){faint} %clr([%X{traceId:-no-trace}]){yellow} %clr(%-40.40logger{39}){cyan} %clr(:){faint} %m%n${LOG_EXCEPTION_CONVERSION_WORD:-%wEx}"/>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml"/>
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

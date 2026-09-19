@@ -1,5 +1,6 @@
 package com.hmdp.utils;
 
+import org.springframework.amqp.core.Message;
 import org.springframework.amqp.core.MessagePostProcessor;
 import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -37,12 +38,10 @@ public class ConfirmedRabbitPublisher {
     public void send(String exchange, String routingKey, Object payload,
                      MessagePostProcessor postProcessor, String correlationId) {
         CorrelationData correlationData = new CorrelationData(correlationId);
-        if (postProcessor == null) {
-            rabbitTemplate.convertAndSend(exchange, routingKey, payload, correlationData);
-        } else {
-            rabbitTemplate.convertAndSend(
-                    exchange, routingKey, payload, postProcessor, correlationData);
-        }
+        // 【链路追踪】所有发送都过这一个出口，所以 traceId 也在这里统一塞消息头：
+        // 业务侧不需要知道有这件事，也不会漏掉某个新加的发送点。
+        rabbitTemplate.convertAndSend(exchange, routingKey, payload,
+                withTraceHeader(postProcessor), correlationData);
 
         try {
             CorrelationData.Confirm confirm = correlationData.getFuture()
@@ -60,5 +59,24 @@ public class ConfirmedRabbitPublisher {
                  | java.util.concurrent.TimeoutException e) {
             throw new IllegalStateException("等待RabbitMQ发布确认失败", e);
         }
+    }
+
+    /**
+     * 把当前线程的 traceId 挂到消息头，消费端用 TraceContext.enterHeader 接。
+     *
+     * 【为什么在这里而不是各业务发送点】本项目所有 MQ 发送都过这个出口，
+     * 一处注入就不会出现"某个新加的发送忘了带 id"。
+     * 【没有 traceId 时不塞头】后台线程自发的消息本来就没有上游，消费端自己起一个 id 就行；
+     * 塞一个空串只会让消息头多一个没意义的字段。
+     */
+    private static MessagePostProcessor withTraceHeader(MessagePostProcessor delegate) {
+        String traceId = TraceContext.current();
+        return message -> {
+            Message result = delegate == null ? message : delegate.postProcessMessage(message);
+            if (traceId != null) {
+                result.getMessageProperties().setHeader(TraceContext.HEADER, traceId);
+            }
+            return result;
+        };
     }
 }

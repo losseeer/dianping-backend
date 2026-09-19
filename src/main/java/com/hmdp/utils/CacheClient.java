@@ -310,7 +310,10 @@ public class CacheClient {
             // 任务开头再读一次缓存：等锁/排队的间隙，可能别的线程已经重建完了
             // （发现未过期就直接返回，省一次DB查询）
             countRebuild(keyPrefix, "claimed");
-            CACHE_REBUILD_EXECUTOR.execute(()->{
+            // 【链路追踪】提交处包一层：MDC 是 ThreadLocal，重建线程看不见触发它的请求。
+            // 不包的话"缓存一直是旧的"这类问题只能靠 key 猜是哪次触发；包上之后
+            // 用户请求日志和重建失败日志是同一个 traceId，一次 grep 就串起来。
+            CACHE_REBUILD_EXECUTOR.execute(TraceContext.wrap(()->{
                 try {
                     String freshJson = stringRedisTemplate.opsForValue().get(key);
                     if (StrUtil.isNotBlank(freshJson)) {
@@ -336,7 +339,7 @@ public class CacheClient {
                     // 2) 缓存数据key被误删，逻辑过期防击穿失效
                     unLock(lockKey, lockValue);
                 }
-            });
+            }));
 
         } else {
             // 锁被别的请求持有，本次不重建（正常现象：热点key过期瞬间只有一个赢家）

@@ -19,6 +19,7 @@ import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.TraceContext;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
@@ -259,7 +260,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 voucherId.toString(), userId.toString(), String.valueOf(orderId), jsonStr,
                 String.valueOf(epochSec),
                 String.valueOf(TimeUnit.MINUTES.toSeconds(RedisConstants.SECKILL_PENDING_ORDER_TTL)),
-                order.getAmount().toString()
+                order.getAmount().toString(),
+                // traceId 随消息进 Stream：秒杀是"下单立即返回、订单几秒后才落库"的异步链路，
+                // 没有这一棒，用户报"我下单没成功"时消费端日志根本对不上是哪次请求。
+                traceId()
         );
         //2.判断结果是否为0（返回码约定见 SECKILL_SCRIPT 常量声明处）
         if (result == null) {
@@ -287,6 +291,19 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      */
     private void countPrecheck(String reason) {
         meterRegistry.counter("dianping.seckill.precheck", "reason", reason).increment();
+    }
+
+    /**
+     * 取当前请求的 traceId；拿不到就现生成一个。
+     *
+     * 【为什么要兜底生成而不是传空】正常入口是 HTTP（TraceFilter 已经放好），
+     * 但这条链路允许被别的线程发起（补偿任务、单测直接调服务）。传空字符串的话
+     * 消费端就只能各起一个 id，等于整条链路没有任何公共标识；
+     * 在提交给 Stream 前生成一个，至少消费端的日志还能被归到这一次调用上。
+     */
+    private String traceId() {
+        String current = TraceContext.current();
+        return current != null ? current : TraceContext.newTraceId();
     }
 
     private static String precheckTag(int code) {

@@ -4,6 +4,7 @@ import cn.hutool.json.JSONUtil;
 import com.hmdp.config.QueueConfig;
 import com.hmdp.service.IPaymentService;
 import com.hmdp.dto.Result;
+import com.hmdp.utils.TraceContext;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
@@ -58,6 +59,14 @@ public class PayNotifyListener {
     @RabbitListener(queues = QueueConfig.PAY_NOTIFY_QUEUE)
     public void handlePayNotify(Message message, Channel channel) throws Exception {
         String msg = new String(message.getBody());
+        // 【链路追踪】消息由 Outbox 发布器投出，头里的 traceId 就是发布器为这条事件起的那个 id，
+        // 于是"事件投递 → 通知用户"两端的日志能并到一起。再往上到"用户支付成功"那一跳只能靠 orderId 对
+        try (TraceContext.Scope ignored = TraceContext.enterHeader(message.getMessageProperties().getHeaders())) {
+            notifyUser(msg);
+        }
+    }
+
+    private void notifyUser(String msg) throws Exception {
         log.info("收到支付通知消息: {}", msg);
 
         try {
@@ -103,6 +112,14 @@ public class PayNotifyListener {
     @RabbitListener(queues = QueueConfig.REFUND_QUEUE)
     public void handleRefundMessage(Message message, Channel channel) throws Exception {
         String msg = new String(message.getBody());
+        // 【链路追踪】退款是"用户点退款 → 订单状态改 → 投消息 → 这里调退款API"，
+        // 出问题时最想知道的就是这一串是不是同一次操作，接上头之后一个 id 查到底
+        try (TraceContext.Scope ignored = TraceContext.enterHeader(message.getMessageProperties().getHeaders())) {
+            doRefund(msg);
+        }
+    }
+
+    private void doRefund(String msg) throws Exception {
         log.info("收到退款处理消息: {}", msg);
 
         try {

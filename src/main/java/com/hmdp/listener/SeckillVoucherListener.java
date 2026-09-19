@@ -8,6 +8,7 @@ import com.hmdp.enums.OrderStatus;
 import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.ConfirmedRabbitPublisher;
 import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.TraceContext;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.MessagePostProcessor;
 import org.springframework.data.redis.connection.RedisConnection;
@@ -247,28 +248,48 @@ public class SeckillVoucherListener {
             return;
         }
         for (MapRecord<String, Object, Object> record : records) {
-            try {
-                VoucherOrder order = toOrder(record.getValue());
-                OrderCreationResult result = voucherOrderService.handleVoucherOrder(order);
-                if (result == OrderCreationResult.ACTIVE_ORDER_EXISTS) {
-                    // 【八股:失败补偿】重复单:回滚Redis库存,但保留一人一单资格(防止反复穿透)
-                    voucherOrderService.releaseRejectedReservation(order, true, false);
-                } else if (result == OrderCreationResult.OUT_OF_STOCK) {
-                    // Redis was ahead of MySQL. Keep the pre-decrement so cached stock converges to DB.
-                    // 【八股:不回滚的智慧】DB库存不足说明Redis领先——保留Redis预扣,
-                    // 让缓存库存向DB收敛,回滚反而会造成Redis超卖
-                    voucherOrderService.releaseRejectedReservation(order, false, true);
-                } else {
-                    sendOrderDelayMessage(order);
-                }
-                acknowledgeAndDelete(record);
-            } catch (IllegalArgumentException e) {
-                log.error("丢弃非法秒杀订单消息: id={}", record.getId(), e);
-                acknowledgeAndDelete(record);
-            } catch (RuntimeException e) {
-                log.error("秒杀订单消息处理失败，保留pending等待重试: id={}", record.getId(), e);
+            // 【链路追踪】逐条消息接力 traceId：本线程是常驻单线程、一轮最多取10条，
+            // 不逐条重置的话这一整轮日志都会挂着第一条消息的 id。
+            // id 来自 seckill.lua 写进 Stream 的字段，于是"用户那次HTTP请求 → 这里落库"是同一个串。
+            try (TraceContext.Scope ignored = TraceContext.enter(recordTraceId(record))) {
+                processRecord(record);
             }
         }
+    }
+
+    private void processRecord(MapRecord<String, Object, Object> record) {
+        try {
+            VoucherOrder order = toOrder(record.getValue());
+            OrderCreationResult result = voucherOrderService.handleVoucherOrder(order);
+            if (result == OrderCreationResult.ACTIVE_ORDER_EXISTS) {
+                // 【八股:失败补偿】重复单:回滚Redis库存,但保留一人一单资格(防止反复穿透)
+                voucherOrderService.releaseRejectedReservation(order, true, false);
+            } else if (result == OrderCreationResult.OUT_OF_STOCK) {
+                // Redis was ahead of MySQL. Keep the pre-decrement so cached stock converges to DB.
+                // 【八股:不回滚的智慧】DB库存不足说明Redis领先——保留Redis预扣,
+                // 让缓存库存向DB收敛,回滚反而会造成Redis超卖
+                voucherOrderService.releaseRejectedReservation(order, false, true);
+            } else {
+                sendOrderDelayMessage(order);
+            }
+            acknowledgeAndDelete(record);
+        } catch (IllegalArgumentException e) {
+            log.error("丢弃非法秒杀订单消息: id={}", record.getId(), e);
+            acknowledgeAndDelete(record);
+        } catch (RuntimeException e) {
+            log.error("秒杀订单消息处理失败，保留pending等待重试: id={}", record.getId(), e);
+        }
+    }
+
+    /**
+     * 取消息里的 traceId。
+     *
+     * 【改造之前入队的消息没有这个字段】返回 null，由 TraceContext.enter 现生成一个——
+     * 上游那一棒确实断了（没得接），但消费端之后的日志（含它转发的延迟消息）仍共用一个新 id。
+     */
+    private static String recordTraceId(MapRecord<String, Object, Object> record) {
+        Object traceId = record.getValue().get("traceId");
+        return traceId instanceof CharSequence ? traceId.toString() : null;
     }
 
     private void acknowledgeAndDelete(MapRecord<String, Object, Object> record) {

@@ -34,6 +34,9 @@ local createEpoch=ARGV[5]
 local pendingTtl=tonumber(ARGV[6])
 --1.7.下单金额快照（分）
 local amount=ARGV[7]
+--1.8.链路追踪id（由HTTP线程取出后随消息一起原子落进Stream）
+local traceId=ARGV[8]
+if (traceId == nil) then traceId = 'none' end
 
 -- 2.数据key
 --2.1.库存key
@@ -82,7 +85,11 @@ redis.call('expire',pendingUserKey,pendingTtl)
 -- 把"扣库存+记录订单+发消息"都放在Lua里原子执行
 -- 确保只要库存扣了，消息就一定发出去了（要么都成功，要么都失败）
 -- 后续消费者从Stream里消费消息，异步创建数据库订单
+-- traceId 一起进消息：这是全链路唯一能把"用户那次HTTP请求"和"几秒后异步落库"
+-- 接上的地方（Stream不像MQ有header，字段就是它的全部元数据）。
+-- 兜底成'none'而不是留空：XADD 传 nil 会直接报错，等于把整个原子脚本打死。
 redis.call('xadd','stream.orders','*',
         'userId',userId,'voucherId',voucherId,'id',orderId,
-        'createEpoch',createEpoch,'amount',amount)
+        'createEpoch',createEpoch,'amount',amount,
+        'traceId',traceId)
 return 0

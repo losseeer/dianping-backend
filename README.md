@@ -10,7 +10,7 @@
 | 存储 | MySQL 8（唯一约束兜底 + 条件更新乐观锁）/ Redis（缓存 / 锁 / 全局 ID / Stream） |
 | 消息 | RabbitMQ（延迟队列 / 通知 / Outbox 发布）/ Redis Stream（秒杀异步落库） |
 | 搜索 | Elasticsearch（IK 分词 + synonym_graph 同义词扩展） |
-| 可观测 | Micrometer + Prometheus 端点（缓存命中 / 限流判定 / 熔断状态跃迁 / Outbox 积压 / 服务端 P99 直方图） |
+| 可观测 | Micrometer + Prometheus 端点（缓存命中 / 限流判定 / 熔断状态跃迁 / Outbox 积压 / 服务端 P99 直方图）；MDC traceId 贯通 HTTP → Stream → MQ → 线程池 |
 | 压测 | JMeter（`stress/` 含场景脚本、数据准备与校验脚本） |
 
 ## 核心设计

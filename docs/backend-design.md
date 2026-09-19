@@ -768,6 +768,34 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 - **Java 多实例**：拦截器 + Redis Token 天然支持 Nginx 多实例集群
 - **Agent 微服务**：可单独扩副本 / 走 GPU 节点，与 Java 解耦
 
+### 10.3 链路追踪（traceId）
+
+指标只能定位到"哪个接口、哪一类结果"。要回答"这一次请求卡在哪一步"，得把它的日志单独捞出来 —— 而本项目的业务普遍跨线程，MDC 是个 ThreadLocal，**不会自动跨线程**，所以每个切换点都要显式接力（`utils/TraceContext`）：
+
+| 切换点 | 接法 | 代码位置 |
+|---|---|---|
+| 客户端 → HTTP 线程 | 读 `X-Trace-Id`（非法则自己生成），并回写响应头 | `config/TraceFilter` |
+| HTTP 线程 → Redis Stream 消费者 | id 作为**消息字段**随 Lua 原子落进 Stream（Stream 没有 header，字段就是全部元数据） | `seckill.lua` + `SeckillVoucherListener` |
+| 生产者 → RabbitMQ 消费者 | 所有发送统一在出口处写消息头，业务侧无感 | `ConfirmedRabbitPublisher` |
+| HTTP 线程 → 缓存重建线程池 | `TraceContext.wrap()` 在**提交处**抓快照（包 ThreadFactory 只能改线程名，改不了 MDC） | `CacheClient` |
+| Outbox 投递（`@Scheduled` 线程） | 无上游，每条事件起一个 id，再经消息头传下去 | `TransactionOutboxPublisher` |
+
+日志侧在 `logback-spring.xml` 的默认格式里插了 `[%X{traceId:-no-trace}]`。`no-trace` 是有意保留的：Hikari / Redisson / Tomcat 接收线程的日志本来就不属于任何请求，把它们和"链路断了"混成一个空括号会误导。
+
+```bash
+curl -X POST -H "authorization: $TOKEN" -H "X-Trace-Id: my-debug-01" \
+     http://localhost:8081/voucher-order/seckill/105
+grep 'my-debug-01' app.log      # HTTP 线程 + seckill-order-consumer + MQ 容器线程的日志一起出来
+```
+
+三条边界，不知道就会误信这个数：
+
+- **入站 id 必须过白名单** `[A-Za-z0-9_-]{8,64}`。traceId 会原样进日志，不校验等于允许调用方往日志里塞东西（curl 本身不允许把头值写成换行，但网关和脚本会解码后再传，所以按字符集校验，不依赖调用方自觉）。实测：`X-Trace-Id: fake%0AEVIL` 被换成一个新生成的 16 位 id，响应头回写的也是新值。
+- **Outbox 落表这一跳不接原始 id**：表里没有 trace 列（加列要走 DDL，项目目前没有迁移工具），写事件的是业务线程、投递的是扫描线程，中间隔一次落表。跨这一跳请用 payload 里的 `orderId` / `tradeNo` grep —— 那本来就是业务主键，比 traceId 更好用。
+- **有 id 不代表有日志**：秒杀成功路径全程零日志（只有降级/异常才打），所以"grep 不到东西"是正常现象。实测验证走的是消息头：带 `X-Trace-Id: phase2-seckill-01` 下单后，`order.delay.queue` 里那条延迟消息的 header 就是同一个值（管理 API `POST /api/queues/%2F/order.delay.queue/get` + `ack_requeue_true`，只读不消费），说明 HTTP → Lua → Stream 消费者 → MQ 四棒全部接上。
+
+再往上一档（跨服务、Java ↔ Agent 同一条 trace、采样与拓扑图）就该上 SkyWalking / Jaeger 了，见 §十二 第 8 条。
+
 ---
 
 ## 十一、文档索引
@@ -796,7 +824,7 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 5. **支付风控**：接入第三方风控（设备指纹、行为分析），PaymentService.payOrder 前置风控检查
 6. **秒杀预热**：秒杀活动开始前把库存预热到 Redis，避免活动开始瞬间 DB 压力
 7. **接口幂等 token**：秒杀接口前置 `GET /voucher-order/token` 获取幂等 token，提交时校验，防重复提交
-8. **链路追踪**：指标出口已落地（`/actuator/prometheus`，见 §10.1）。剩下的两块：① traceId 贯通——HTTP filter 写 MDC，并在 `SeckillVoucherListener`/`PayNotifyListener`/`OrderDelayListener`/`TransactionOutboxPublisher` 这四个 MDC 会自动丢失的异步入口重新注入；② 若要跨 Java ↔ Agent 微服务串起来，再引入 SkyWalking / Jaeger
+8. **链路追踪**：指标出口（`/actuator/prometheus`，§10.1）与单机 traceId 贯通（§10.3）已落地，覆盖 HTTP / Redis Stream / RabbitMQ / 线程池 / `@Scheduled` 五类切换点。剩下的都是"跨进程"那一档：① Agent 微服务是这套接口的调用方，它只要在请求里带上 `X-Trace-Id`，两边日志就能并到一条链上——机制在本仓库已经就绪，缺的是 Agent 侧那段改动的约定；② 采样、拓扑图、按服务聚合的 P99 需要 SkyWalking / Jaeger 这类专门组件，单靠 MDC 不再往上加
 
 ---
 

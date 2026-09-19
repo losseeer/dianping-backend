@@ -2,6 +2,7 @@ package com.hmdp.listener;
 
 import com.hmdp.config.QueueConfig;
 import com.hmdp.service.IVoucherOrderService;
+import com.hmdp.utils.TraceContext;
 import com.rabbitmq.client.Channel;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.Message;
@@ -75,6 +76,14 @@ public class OrderDelayListener {
     @RabbitListener(queues = QueueConfig.ORDER_CANCEL_QUEUE)
     public void handleOrderCancel(Message message, Channel channel) throws Exception {
         String msg = new String(message.getBody());
+        // 【链路追踪】这条延迟消息是秒杀消费线程转发的，头里的 id 一路来自最初那次下单请求，
+        // 于是"用户下单 → 30 分钟后超时取消"两端日志是同一个 id，能一路 grep 下来。
+        try (TraceContext.Scope ignored = TraceContext.enterHeader(message.getMessageProperties().getHeaders())) {
+            cancelOrder(msg);
+        }
+    }
+
+    private void cancelOrder(String msg) throws Exception {
         log.info("收到订单超时取消消息: {}", msg);
 
         try {
