@@ -35,6 +35,14 @@ import java.lang.annotation.*;
  *   private Result seckillFallback(Long voucherId) {
  *       return Result.fail("当前排队人数较多，请稍后再试");
  *   }
+ *
+ * 【qps 现在是「默认值」而不是「配置」】
+ * 运行期可以用 {@code PUT /config/ratelimit?api=全限定类名.方法名&qps=...} 覆盖，
+ * 覆盖值写在 Redis 里、由 {@code rate-limit.lua} 在同一次原子求值里读出并当场重算容量/速率，
+ * 全部实例下一个请求起生效，删掉键就回到这里的注解值。
+ * 所以：注解上的数字仍然是代码（走 review、跟版本回滚），运行期的那个数字是临时覆盖。
+ * 两者不一致时以 Redis 里的为准 —— {@code GET /config} 同时回显 annotationQps / override /
+ * effectiveQps 三列，就是为了让人一眼看出当前到底走的哪一个。
  */
 @Target(ElementType.METHOD)
 @Retention(RetentionPolicy.RUNTIME)
@@ -42,7 +50,7 @@ import java.lang.annotation.*;
 public @interface RateLimit {
 
     /**
-     * 每秒允许的请求数（QPS）
+     * 每秒允许的请求数（QPS），必须 &gt;= 1；这是「默认值」，运行期可被 Redis 里的规则覆盖（见类注释）
      * 默认100，秒杀接口建议设50，普通接口设200
      */
     double qps() default 100;

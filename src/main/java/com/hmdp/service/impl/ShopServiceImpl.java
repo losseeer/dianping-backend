@@ -4,11 +4,14 @@ import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
+import com.hmdp.listener.TransactionOutboxPublisher;
+import com.hmdp.listener.TransactionOutboxWriter;
 import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SystemConstants;
 import org.springframework.data.geo.Distance;
 import org.springframework.data.geo.GeoResult;
@@ -41,6 +44,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Resource
     private CacheClient cacheClient;
+
+    @Resource
+    private TransactionOutboxWriter outboxWriter;
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
     @Override
     public Result queryById(Long id){
         // 先用逻辑过期策略查缓存（热点key场景）
@@ -79,7 +89,47 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
         //2.删除缓存
         stringRedisTemplate.delete(CACHE_SHOP_KEY+shop.getId());
+        //3.投 ES 增量同步事件（与 updateById 同事务：库改成功 = 事件一定在）
+        submitEsSync(id);
         return Result.ok();
+    }
+
+    /**
+     * 新增商铺 —— 覆写 MyBatis-Plus 的 save，是为了把「落库」和「投 ES 同步事件」绑在同一个事务里。
+     *
+     * 原来 ShopController.saveShop 只调 shopService.save()，新商铺从此在索引里查不到；
+     * 靠调用方「记得顺手多调一次同步接口」是迟早会漂移的写法，也是一种双写（写库成功、写 ES 失败
+     * 的中间态回滚不了）。放到这里，任何走 IShopService#save 的写入都自动挂上同步事件，
+     * 忘记同步不再是可能的错误。
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public boolean save(Shop shop) {
+        if (!super.save(shop)) {
+            return false;
+        }
+        submitEsSync(shop.getId());
+        return true;
+    }
+
+    /**
+     * 在当前业务事务内投一条 ES 同步事件，由 TransactionOutboxPublisher 异步回查 MySQL 后写索引。
+     *
+     * 【为什么 eventKey 要额外拼一个全局唯一 id】
+     * tb_transaction_outbox 上有 uk_event_key 唯一索引，而 TransactionOutboxWriter 撞重复键时
+     * 只打一行 debug 就当无事发生。如果这里用 "es-sync:{shopId}" 这种纯业务键去做幂等，
+     * 同一个商铺的第二次更新会被静默吞掉 —— 只有第一次改动能同步到 ES，并且不报任何错。
+     * 所以刻意让每次写入都产生新键：同步的正确性不依赖事件去重，而依赖消费端
+     * 「只取 id、回查 MySQL 当前值」（见 IShopSearchService#syncShopById），
+     * 重复投递只是把同一份数据再写一遍，天然幂等。
+     *
+     * 【为什么只传 id 不传实体】updateById 只更新非空字段，传进来的 Shop 常常只有半条数据，
+     * 拿它拼 ES 文档会把没提交的字段写成 null。
+     */
+    private void submitEsSync(Long shopId) {
+        outboxWriter.save("es-sync:" + shopId + ":" + redisIdWorker.nextId("outbox-es"),
+                TransactionOutboxPublisher.ES_SYNC, shopId,
+                Collections.<String, Object>singletonMap("shopId", shopId));
     }
 
     @Override

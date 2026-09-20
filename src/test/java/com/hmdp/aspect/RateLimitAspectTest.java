@@ -13,9 +13,11 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.lang.reflect.Method;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -155,6 +157,25 @@ class RateLimitAspectTest {
             assertTrue(expected.getMessage().contains("qps"));
         }
         verify(jp, never()).proceed();
+    }
+
+    // ---------------------------------------------------------------- 注解默认值登记表
+
+    @Test
+    @DisplayName("被调用过的接口会登记注解 qps，供 GET /config 列出处置清单")
+    void recordsAnnotationDefaultForCalledApis() throws Throwable {
+        ProceedingJoinPoint jp = joinPointFor("plain", "proceeded");
+        installLimiter(RedisRateLimiter.Outcome.ALLOWED);
+
+        assertTrue(aspect.annotationDefaults().isEmpty(), "还没调用过，登记表应该是空的");
+        aspect.around(jp, annotationOf("plain"));
+
+        assertEquals(10.0, aspect.annotationDefaults().get(Fixture.class.getName() + ".plain"),
+                "登记的是注解上的 qps，不是实际生效值 —— 覆盖值在 Redis 里，切面看不到");
+
+        Map<String, Double> view = aspect.annotationDefaults();
+        assertThrows(UnsupportedOperationException.class, () -> view.put("x", 1.0),
+                "给管理接口的必须是只读视图，否则谁都能往里塞一条伪造的\"默认值\"");
     }
 
     // ---------------------------------------------------------------- 辅助

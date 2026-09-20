@@ -14,7 +14,9 @@ import com.hmdp.entity.Shop;
  * 【八股：ES与MySQL的职责分工】
  * - MySQL：负责事务性写入、精确查询（按ID查、按外键查）
  * - ES：负责全文搜索、复杂条件查询、相关度排序
- * - 两者通过数据同步保持一致（本项目采用全量同步 + 单条导入方式）
+ * - 两者的一致性：MySQL 是唯一事实源，ES 只是它的投影，允许短暂落后但不允许长期漂移。
+ *   写路径投 ES_SYNC 事件 → Outbox 异步回查 MySQL 落索引（增量）；
+ *   {@link #rebuildIndex()} 做全量对账（改 mapping/同义词、或增量事件进死信后的人工修复）。
  */
 public interface IShopSearchService {
 
@@ -49,6 +51,22 @@ public interface IShopSearchService {
      * @return 导入结果
      */
     Result importShop(Shop shop);
+
+    /**
+     * 按 id 增量同步单个商铺到 ES —— Outbox 的 ES_SYNC 事件投递时调用。
+     *
+     * 【为什么入参是 id 而不是 Shop】
+     * 传 id、由同步方回查 MySQL，是这套设计里唯一能同时做到「不丢更新」和「天然幂等」的形状：
+     * 1. 事件里带 Shop 快照的话，两条乱序的事件会把索引写成旧值；带 id 则永远取到当前值。
+     * 2. 重复消费同一条事件只是把同一份数据再写一遍，无副作用 —— 这正是「至少一次」语义
+     *    所需要的消费端幂等，不必为事件再加版本号。
+     *
+     * 与 {@link #importShop(Shop)} 的差别：importShop 是管理接口，调用方手里已经有实体；
+     * 本方法是异步链路入口，必须以「MySQL 为准」重新取数，并且要处理「行已不存在 → 删文档」。
+     *
+     * @param shopId 商铺 id
+     */
+    void syncShopById(Long shopId);
 
     /**
      * 重建 ES shop 索引（DROP + CREATE + PUT MAPPING + 重新 MySQL 全量导入）。

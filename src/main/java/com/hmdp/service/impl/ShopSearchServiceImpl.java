@@ -463,4 +463,44 @@ public class ShopSearchServiceImpl implements IShopSearchService {
     private ShopDoc convertToShopDoc(Shop shop) {
         return ShopDocConverter.fromShop(shop);
     }
+
+    /**
+     * 按 id 增量同步单个商铺到 ES（Outbox 的 ES_SYNC 事件投递时调用）
+     *
+     * 【八股：增量同步的三种触发点，本项目选了哪种】
+     * 1. 双写：业务代码里同步写 MySQL + ES。最简单，但 ES 一挂就不能改商铺了，
+     *    而且"库成功、ES 失败"的中间态无法回滚。
+     * 2. Binlog 监听（Canal）：业务代码零改动，延迟低，是最标准的做法，代价是多一套常驻组件。
+     * 3. 事件表 + 异步消费（本项目）：写库事务里同事务落一条 ES_SYNC 事件，
+     *    由 Outbox 发布器异步回查 MySQL 再写 ES。写不进 ES 不影响业务，
+     *    失败有退避重试和死信兜底 —— 复用了支付通知那条已经跑通的链路。
+     *
+     * 【失败会怎样】这里刻意不 catch：抛出去由 TransactionOutboxPublisher 记 failed 并退避重试，
+     * 超过 max-retry 转死信(status=3)。若在 ES 长期不可用时想立刻恢复，
+     * 直接调 POST /shop/search/rebuild-index 做全量对账，比等重试链跑完更快。
+     */
+    @Override
+    public void syncShopById(Long shopId) {
+        // 只认 id，其余字段一律回查 MySQL —— 事件里的快照会过期，库里的才是当前值
+        Shop shop = shopService.getById(shopId);
+        if (shop == null) {
+            // 行已经不存在（人工 DELETE，或先删行后投递）。索引里留一条点进去就 404 的商铺，
+            // 比搜索结果少一条更糟，所以这里补上项目原先完全没有的"删文档"这一路。
+            deleteDoc(shopId);
+            log.info("[ES] 增量同步：商铺{}在 MySQL 中已不存在，同步删除索引文档", shopId);
+            return;
+        }
+        shopDocRepository.save(convertToShopDoc(shop));
+        log.info("[ES] 增量同步完成：shopId={}, name={}", shopId, shop.getName());
+    }
+
+    /**
+     * 先 exists 再 delete：商铺从没进过索引是常态（比如新增后立刻被删），
+     * 不该为它发一次注定 404 的 DELETE 请求，把一次正常同步变成一条假失败。
+     */
+    private void deleteDoc(Long shopId) {
+        if (shopDocRepository.existsById(shopId)) {
+            shopDocRepository.deleteById(shopId);
+        }
+    }
 }

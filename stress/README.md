@@ -82,12 +82,28 @@ WARN 超时取消失败，订单不存在: orderId=638562427465641830
 
 **场景 B：关限流测后端容量**（给第四节调阈值用）
 
+阈值不用改代码重启了，运行期覆盖就行（详见 `docs/backend-design.md` §5.4）。
+`$TOKEN` 的取法见下面场景 C；它是**登录用户**的 token，`/config/**` 不在登录白名单里。
+
 ```bash
-# 1. VoucherOrderController 的 @RateLimit qps 临时改为 100000
-# 2. 重启应用
-# 3. 重跑「一、跑一轮」的后三步
-# 4. 改回 qps = 50 并重启  ← 忘了还原 = 秒杀完全不设防
+API=com.hmdp.controller.VoucherOrderController.seckillVoucher
+
+# 1. 把秒杀阈值顶到写入接口允许的上限（100000），全部实例下一个请求起生效
+curl -s -X PUT -H "authorization: $TOKEN" "http://127.0.0.1:8081/config/ratelimit?api=$API&qps=100000"
+
+# 2. 重跑「一、跑一轮」那三步（prepare → jmeter → verify）
+
+# 3. 删掉覆盖，回到注解上的 qps=50
+curl -s -X DELETE -H "authorization: $TOKEN" "http://127.0.0.1:8081/config/ratelimit?api=$API"
 ```
+
+> **还原这件事现在可以自查**：改完立刻 `curl -s -H "authorization: $TOKEN" http://127.0.0.1:8081/config`，
+> 那一行的 `overridden` 还是 `true` 就是没还原。以前"忘了还原 = 秒杀完全不设防"只能靠记性，
+> 现在是一条命令看出来 —— 但也因此多了一个以前没有的失效模式：**覆盖只活在 Redis 里**，
+> `FLUSHALL` 或换实例就悄悄回到 50；所以压测报告的复现步骤里必须写清当时那一行的 effectiveQps。
+>
+> 还有：`prepare.sh` 每轮清的是 `ratelimit:api:*` 令牌桶，**不清** `config:ratelimit:rule:*` 覆盖。
+> 所以带着覆盖连跑两轮，第二轮的阈值不会自己恢复原状。
 
 **场景 C：ab 交叉验证**（排除 JMeter 自身瓶颈）
 
@@ -167,6 +183,10 @@ ab -n 3000 -c 1000 -k -p /tmp/empty_post.txt -T "application/json" \
 | 支付 `pay` | 20 | false | ⚠️ 需自建脚本（脚手架未覆盖）；瓶颈通常在外部渠道不在本服务 |
 | 登录 `login` | 5 | true | ❌ **不是数值问题**：全局 5 QPS = 5 个攻击者就能让全站登不上，该改成按手机号/IP 维度（参照 `SmsRateLimiter`） |
 | 发验证码 `sendCode` | — | — | 已按手机号限流，不适用本表 |
+
+> 表里的 `qps` 是**注解默认值**。场景 B 那种运行期覆盖不会改这张表，也不会跟着代码走 ——
+> 覆盖只存在于 Redis 的 `config:ratelimit:rule:{api}` 键里，**只有 `DELETE /config/ratelimit?api=…`
+> 才回到本表的数字**；重启应用不吃掉它（覆盖在 Redis 里，不在 JVM 里）。调完阈值请重跑场景 A 对账。
 
 **三个陷阱**：
 

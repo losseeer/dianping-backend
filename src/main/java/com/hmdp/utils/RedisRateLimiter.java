@@ -9,7 +9,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
-import java.util.Collections;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -116,7 +116,8 @@ public class RedisRateLimiter {
      * 尝试获取一个令牌。
      *
      * @param methodKey 方法标识（全限定类名.方法名），会拼上 {@link RedisConstants#RATE_LIMIT_API_KEY}
-     * @param qps       目标速率，必须 &gt;= 1
+     * @param qps       注解上的目标速率，必须 &gt;= 1；如果 Redis 里配了
+     *                  {@link RedisConstants#RATE_LIMIT_RULE_KEY} 规则，实际生效的是规则值
      */
     public Outcome tryAcquire(String methodKey, double qps) {
         // 【为什么直接抛而不是拒绝】qps < 1 时桶容量 < 1，令牌永远凑不够一个，
@@ -139,8 +140,11 @@ public class RedisRateLimiter {
         };
 
         try {
+            // KEYS[1]=桶，KEYS[2]=运行期阈值覆盖（见 rate-limit.lua 的 0. 步）。
+            // 注解上的 qps 因此退化为「这条规则不存在时的默认值」。
             Long code = scriptRunner.run(
-                    Collections.singletonList(RedisConstants.RATE_LIMIT_API_KEY + methodKey), argv);
+                    Arrays.asList(RedisConstants.RATE_LIMIT_API_KEY + methodKey,
+                            DynamicConfig.rateLimitRuleKey(methodKey)), argv);
 
             if (code == null) {
                 warnThrottled("限流脚本返回 null，本次判定为不可用", null);

@@ -53,6 +53,12 @@ import java.util.stream.Collectors;
  *    要么 fallback 到 standard（同义词根本不生效）。所以这里必须手动创建 settings 包含完整
  *    shop_synonyms（synonym_graph） + shop_index_ik（ik_max_word） + shop_search_synonym（ik_smart+同义词）
  *    这三个分析链定义，然后 putMapping。
+ *
+ *  【这条启动流程在一致性链路里的位置：对账，不是同步】
+ *    商铺日常的增改由 ShopServiceImpl 写事务时投一条 ES_SYNC 事件、由 Outbox 发布器异步落索引
+ *    （见 IShopSearchService#syncShopById）。本类只负责两件事：索引不存在时把 settings/mapping 建出来，
+ *    以及需要时把 MySQL 整表重导一遍做全量对账 —— 改了 mapping/同义词，或者增量事件进了死信，都靠它修复。
+ *    所以 rebuild-on-startup 默认 false：它不再是"数据能不能搜到"的前提，只是一次可选的对账。
  */
 @Slf4j
 @Configuration

@@ -82,7 +82,7 @@ Java Spring Boot 后端（:8081）是「快评」平台的**交易与业务核�
 
 > 选型对照（面试八股）：
 > - **Redis+Lua 令牌桶 vs 单机 Guava RateLimiter**：Guava 的限流器是 JVM 进程内对象，部署 N 个实例阈值就放大 N 倍，且实例重启后桶是满的（每次发布白送一波突发）。本项目已改为 Redis + Lua 实现，状态跨实例共享。
-> - **Redis+Lua vs Sentinel**：本项目要的是"阈值在多实例下成立"，Redis+Lua 已足够且无额外运维成本。Sentinel 的增量价值在**控制面**——规则动态推送（不改代码不重启即可调阈值）、热点参数限流、Dashboard 可视化。需要这些时再引入。
+> - **Redis+Lua vs Sentinel**：本项目要的是"阈值在多实例下成立"，Redis+Lua 已足够且无额外运维成本。规则动态推送自己也做了（§5.4：阈值写在 Redis 规则键里，Lua 当场读，改阈值零重启）。Sentinel 剩下的增量价值是**控制面的工程化**——规则的持久化与变更审计、Dashboard 可视化、热点参数限流；这三样都不需要改判定逻辑，切换点在"谁来写那个规则键"。
 > - **ES vs MySQL LIKE**：MySQL `LIKE '%kw%'` 无法走索引、不支持分词；ES 基于倒排索引接近 O(1)，支持分词、高亮、相关度排序、聚合。
 > - **synonym_graph vs 普通 synonym filter**：synonym_graph 保留多词条同义词（日本料理 = 日料）的位置偏移关系，不会产生假匹配，短语级 query 精度显著更好。
 > - **Redisson vs 自研 setnx 锁**：自研锁不可重入、无续期、主从一致性有问题；Redisson 用 Hash 存储重入计数 + WatchDog 续期 + multiLock 红锁解决主从一致。
@@ -340,6 +340,23 @@ POST /shop/_analyze
 
 **深分页保护**：`from + size` 不能超过 10000（ES `index.max_result_window` 默认值）；超限直接返回错误，提示使用 `search_after` 方式。
 
+**MySQL → ES 数据同步（写事务投事件 + 全量对账）**
+
+历史上这里是个真断口：`ShopController.saveShop` 与 `ShopServiceImpl.update` 只写库、只删缓存，**完全不碰 ES**，也没有任何删文档的路径 —— 索引和 MySQL 静默漂移，只能靠启动时全量重导碰运气。现在拆成两层：
+
+| 层 | 谁负责 | 时机 |
+| --- | --- | --- |
+| 增量 | `ShopServiceImpl.save/update` 在**业务事务内**投 `ES_SYNC` 事件 → `TransactionOutboxPublisher` 回查 MySQL 落索引 | 每次写入，秒级跟进 |
+| 对账 | `POST /shop/search/rebuild-index`（或 `rebuild-on-startup=true`） | 改 mapping/同义词、事件进死信后的人工修复 |
+
+三个设计点：
+
+1. **事件只带 `shopId`，文档内容一律回查 MySQL。** `updateById` 只更新非空字段（实测：PUT 只提交 `name`+`avgPrice`，`area`/`type_id` 原值保留），把请求体里的半条实体拼成文档会把未提交字段写成 `null`；而带快照在事件乱序/重放时还会写回旧值。带 id 则永远取到当前值，重复投递天然幂等。
+2. **`event_key` 必须每次唯一**（`es-sync:{shopId}:{RedisIdWorker}`）。事件表上有 `uk_event_key` 唯一索引，且 `TransactionOutboxWriter` 撞重复键只打一行 debug。若用 `es-sync:{shopId}` 做"幂等键"，同一商铺第二次更新会被静默吞掉、零报错。
+3. **投递走 Outbox 内联分支，不投 MQ**（与 `REDIS_COMPENSATION` 同一形状）：消费者要做的事和发布器完全一样，中间那跳队列不提供任何东西；而本项目的队列都没配 DLX，`@RabbitListener` 抛异常 = 消息 requeue，ES 长期不通就是热循环刷日志。走 outbox 免费拿到指数退避 + 死信落表。
+
+**已知局限**：① ES "慢而不通"时会拖住这条共用的扫描线程，`PAY_NOTIFY` 的延迟跟着涨（要隔离得给 `ES_SYNC` 单开调度池）；② 行被物理删除但没人投事件时，索引里的孤儿文档要等下次全量对账才清；③ 生产形态应是 Canal 订阅 binlog —— 切换点只有一个：把 `ES_SYNC` 事件的写入方从业务代码换成 Canal adapter，消费端 `syncShopById` 原样复用。
+
 ### 3.6 接口限流 + 熔断（AOP 自定义注解）
 
 **两个自定义注解**：
@@ -348,6 +365,25 @@ POST /shop/_analyze
 |---|---|---|
 | `@RateLimit(qps=50, failOpen=false, message="活动太火爆了")` | RateLimitAspect + RedisRateLimiter（Redis + Lua 令牌桶，**跨实例、全站维度**） | 登录 5QPS / 秒杀 50QPS / 搜索 100QPS / 支付 20QPS |
 | `@CircuitBreaker(failureThreshold=5, recoveryTimeout=30000, slidingWindow=60000, fallback="searchFallback")` | CircuitBreakerAspect + ConcurrentHashMap<方法名, BreakerInfo> | 商铺详情 fallback=MySQL / ES 搜索 fallback=MySQL LIKE |
+
+**qps 的两级来源**（注解是默认值，Redis 是运行期覆盖）：
+
+```
+rate-limit.lua 第 0 步：GET config:ratelimit:rule:{api}
+    能解析成数字且 >= 1  →  RATE / CAP 一起按它重算
+    否则（键不存在/脏值/<1）→ 用 @RateLimit(qps=...)，行为与引入该键之前逐字节一致
+```
+
+| 决策 | 为什么这样选 |
+|---|---|
+| 覆盖值放 Redis 而不是配置中心/环境变量 | 所有实例读同一份，写一次全站生效；改注解 = 一次全量发布 + 重新预热缓存，为一个开关付这个不值 |
+| 读取发生在 Lua 里，不在 Java 里读完传 ARGV | 限流是热路径，先 GET 再 EVAL 凭空多一个 RTT；更关键的是「读到的规则」与「写回的桶」之间不能有窗口，否则改规则的瞬间各实例各按新旧两套速率补同一个桶 |
+| 覆盖只改 `RATE`/`CAP`，`BURST = CAP/RATE` 从 ARGV 反推 | 「突发窗口是几秒」这个决定只留在 Java 的 `MAX_BURST_SECONDS` 一处，Lua 不复制常量 |
+| 阈值调小立刻见效 | `math.min(CAP, tokens + …)` 顺带把桶里攒下的旧令牌夹到新容量，不需要等它自然耗尽 |
+| 非法值忽略而不是拒绝 | `qps < 1` 会让桶容量不足一个令牌 = 静默打死接口；`EXPIRE key 0` 之类的坑也只能靠"不让配置驱动它"来防。写入口 `/config` 有校验，走到这个分支只可能是有人直接 `redis-cli` 塞了脏值 |
+| 删掉规则键 = 回到注解默认值 | 规则键只被读取、不被任何写入方回填，所以它永远是唯一事实源（把 qps 塞进令牌桶 Hash 的做法会被旧键里的旧值静默覆盖） |
+
+**已知局限**：Redis Cluster 下 `KEYS[1]`（`ratelimit:api:`）与 `KEYS[2]`（`config:ratelimit:rule:`）前缀不同会落到不同 slot，脚本报 CROSSSLOT；届时的改法是两个键加同一个 hash tag（单机/主从无此问题）。运维入口见 §5.4。
 
 **三态熔断器状态机**（BreakerState 枚举 + CAS 保证状态转换原子性）：
 
@@ -534,6 +570,48 @@ ShopSearchController → ShopSearchServiceImpl.rebuildIndex → ElasticsearchCon
 
 ---
 
+### 5.4 运行期动态配置（零重启）
+
+两类值可以在不发布的前提下改掉，都存在 Redis 的 `config:` 命名空间下，读写都走 `DynamicConfig`：
+
+| 配置 | 键 | 合法区间 | 越界/脏值时 |
+|---|---|---|---|
+| 接口限流阈值 | `config:ratelimit:rule:{全限定类名.方法名}` | `[1, 100000]` | 忽略覆盖，用注解值 |
+| Outbox 扫描间隔 | `config:outbox:publish-interval-ms` | `[200, 10000]` ms | 忽略覆盖，用 `transaction.outbox.publish-interval-ms` |
+
+**管理接口**（需要登录态；`/config/**` 不在 `MvcConfig` 的登录白名单里，所以未登录 401，但**任何登录用户都能改**——本项目没有角色体系，与 `MvcConfig` 里记的"白名单按前缀放行过宽"是同一条缺陷的两个方向）：
+
+```bash
+curl -s -H "authorization: $TOKEN" http://127.0.0.1:8081/config          # 三列总览
+curl -s -X PUT  -H "authorization: $TOKEN" \
+  "http://127.0.0.1:8081/config/ratelimit?api=com.hmdp.controller.UserController.login&qps=1"
+curl -s -X DELETE -H "authorization: $TOKEN" \
+  "http://127.0.0.1:8081/config/ratelimit?api=com.hmdp.controller.UserController.login"
+curl -s -X PUT -H "authorization: $TOKEN" "http://127.0.0.1:8081/config/outbox-interval?ms=200"
+```
+
+`api` 走 query 参数而不是路径变量（值里全是点，放路径里会被后缀模式匹配截掉一段），且需要 URL 编码 —— 实测 `?api=a{b}.c` 会被容器归一化成 `ab.c`，所以**响应里回显的 `api` 才是真正写进去的键**。
+
+**「扫描间隔」怎么做到不改 `@Scheduled` 也能变**：Spring 5.2 没有自适应 trigger，`fixedDelayString` 只在启动时解析一次。所以发布器以最小粒度 200ms 空转（`SCAN_TICK_MS`，与可调下限同源），每轮开头读一次间隔键决定"到点没有"：
+
+- 多出来的是每轮一次 Redis GET，换来的是积压时能把间隔从 1s 立刻压到 200ms 追平。
+- 心跳指标 `dianping_outbox_last_scan_age_seconds` 在**门控之前**更新，所以它量的是"调度线程活着"，把间隔调大不会撞上 `> 30s` 的「publisher 卡死」告警；真卡死时 tick 根本不会发生，告警照旧有效。
+- 上限只到 10s：再长就是"暂停投递"，而那种状态在监控上长得和"一切正常"一样，该用停实例这种显式手段。
+
+**实测（单机，本地 Redis/MySQL 均在跑）**：
+
+| 动作 | `/user/login` 一批 40 并发里的放行数 | Outbox 一条新事件从落库到被投递的等待 |
+|---|---|---|
+| 注解 `qps=5` | 5 | — |
+| `PUT …qps=1` | **1** | — |
+| `DELETE` 覆盖 | 5（立刻回到注解值） | — |
+| `PUT /config/outbox-interval?ms=10000` | — | **8.87s** |
+| `PUT /config/outbox-interval?ms=200` | — | **0.27s** |
+
+三次阈值操作全程没有重启，`GET /config` 回显的 `effectiveQps` 与实测放行数逐条对得上。
+
+---
+
 ## 六、API 端点设计
 
 ### 6.1 用户模块
@@ -596,7 +674,20 @@ ShopSearchController → ShopSearchServiceImpl.rebuildIndex → ElasticsearchCon
 | GET  | `/recommend/nearby` | 附近热门（GEO + score/sold 排序） | — |
 | GET  | `/recommend/hot` | 全站热榜（ZSet） | — |
 
-### 6.7 统一响应格式
+### 6.7 运行期配置（`ConfigController`）
+
+| 方法 | 路径 | 说明 | 保护 |
+|------|------|------|------|
+| GET | `/config` | 总览：每一项动态配置的「注解/默认值 · 覆盖值 · 实际生效值」三列 | `@RateLimit(10 QPS)` + 需登录 |
+| GET | `/config/ratelimit?api=` | 单个接口的限流规则；既没配过也不在登记表里时报「未配置」，不回显空行 | 同上 |
+| PUT | `/config/ratelimit?api=&qps=` | 覆盖 qps，全部实例下一个请求起生效；越界（`<1` 或 `>100000`）拒绝且不写任何键 | 同上 |
+| DELETE | `/config/ratelimit?api=` | 删除覆盖 = 回到注解默认值 | 同上 |
+| PUT | `/config/outbox-interval?ms=` | 调整 Outbox 扫描间隔，合法区间 `[200, 10000]` ms | 同上 |
+| DELETE | `/config/outbox-interval` | 回到 `transaction.outbox.publish-interval-ms` | 同上 |
+
+约定两点（细节见 §5.4）：`api` 只能走 query 参数（值里全是点，放路径会被 Spring MVC 的后缀匹配截掉最后一段），响应回显的 `api` 才是真正写进 Redis 的键；`/config/**` 只做了「需登录」，没有角色校验 —— 与 `MvcConfig` 白名单过宽是同一条已知缺陷，切换点在 `LoginInterceptor` 之后加一个角色拦截器。
+
+### 6.8 统一响应格式
 
 ```java
 // Result.java
@@ -823,8 +914,8 @@ grep 'my-debug-01' app.log      # HTTP 线程 + seckill-order-consumer + MQ 容�
 
 ## 十二、未来扩展点（预留）
 
-1. **MySQL Binlog 增量同步 ES**：当前全量同步（重启重导），生产应用 Canal 监听 Binlog → 增量同步 ES，实现准实时一致
-2. **限流控制面**：阈值已能跨实例生效（Redis + Lua 令牌桶），但改阈值仍需改注解并重启。缺的是动态规则推送——引入 Sentinel 或把阈值放进配置中心即可补齐
+1. **ES 同步换成 Canal 订阅 Binlog**：增量同步已落地（§3.5：写事务投 `ES_SYNC` 事件 → Outbox 回查 MySQL 落索引 + `rebuild-index` 对账）。换 Canal 能再拿走两件事：① 业务代码里那次 `submitEsSync` 彻底消失，改库不再只有"走 IShopService"这一条路才同步（现在直连 SQL 改表仍然要等对账）；② 物理删行也能被捕获，不留孤儿文档。切换点只有一处：事件写入方由业务代码换成 Canal adapter，`syncShopById` 原样复用
+2. **限流控制面**：动态规则已落地（§5.4：`/config` 写 Redis 规则键，`rate-limit.lua` 第 0 步读它，改阈值零重启、全部实例下一个请求起生效）。剩下的三件事都要靠外部组件，而且都不改判定逻辑：① **推送形态** —— 现在是人调 HTTP 写 Redis，接 Sentinel / Nacos 后换成规则中心推给一个「写 Redis 的人」，切换点就是 `DynamicConfig.put` 的调用方（Lua 侧一行不用动）；② **持久化与审计** —— 覆盖值只有 Redis 一份，`FLUSHALL` 或换实例就全丢，也没有「谁在什么时候改成了多少」的记录，配置中心天然带这两样；③ **多键原子性** —— Redis Cluster 下 `rate-limit.lua` 的 KEYS[1]（桶）与 KEYS[2]（规则）会落不同 slot 而报 CROSSSLOT，文档里记的解法是给同一个 api 的键加 hash tag，那要同时改 `RedisRateLimiter` 的键拼装和 `DynamicConfig.rateLimitRuleKey`
 3. **Sentinel 替代自研熔断器**：自研三态熔断器满足单机需求，Sentinel 提供更丰富的规则配置 + Dashboard 可视化
 4. **分库分表**：`tb_voucher_order` 按用户 ID 取模分表，RedisIdWorker 已支持分布式 ID
 5. **支付风控**：接入第三方风控（设备指纹、行为分析），PaymentService.payOrder 前置风控检查

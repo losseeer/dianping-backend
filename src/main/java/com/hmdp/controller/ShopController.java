@@ -91,6 +91,9 @@ public class ShopController {
      * 新增商铺信息
      * @param shop 商铺数据
      * @return 商铺id
+     *
+     * ES 不用在这里补：ShopServiceImpl#save 会在同一个事务里投一条 ES_SYNC 事件，
+     * 索引由 Outbox 异步跟进（这里再手调一次同步接口就变回双写了）
      */
     @PostMapping
     public Result saveShop(@RequestBody Shop shop) {

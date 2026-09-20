@@ -11,6 +11,9 @@ import org.aspectj.lang.annotation.Aspect;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.Resource;
+import java.util.Collections;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * 限流切面 —— 基于 Redis 分布式令牌桶
@@ -54,9 +57,25 @@ public class RateLimitAspect {
     @Resource
     private MeterRegistry meterRegistry;
 
+    /**
+     * 注解默认值登记表：api（全限定类名.方法名）→ 注解上的 qps。
+     *
+     * 【为什么记在这里】注解只有切面读得到，记在别处就是第二份需要人工同步的副本。
+     * 【口径】只包含启动后被调用过的接口。它的用途是给 {@code GET /config} 一份
+     * 可发现的 api 清单（不然运维得背出 {@code com.hmdp.xxx.YyyController.zzz} 这种字符串），
+     * 不是完整清单 —— 从没被调用过的接口要改阈值，得自己知道 api。
+     */
+    private final Map<String, Double> annotationDefaults = new ConcurrentHashMap<>();
+
+    /** 供管理接口回显「默认值 / 覆盖值 / 实际生效值」 */
+    public Map<String, Double> annotationDefaults() {
+        return Collections.unmodifiableMap(annotationDefaults);
+    }
+
     @Around("@annotation(rateLimit)")
     public Object around(ProceedingJoinPoint joinPoint, RateLimit rateLimit) throws Throwable {
         String methodName = AspectFallbackSupport.getMethodName(joinPoint);
+        annotationDefaults.putIfAbsent(methodName, rateLimit.qps());
 
         RedisRateLimiter.Outcome outcome;
         try {
@@ -92,7 +111,10 @@ public class RateLimitAspect {
             case REJECTED:
             default:
                 count(methodName, "rejected");
-                log.warn("接口被限流: {} | 当前QPS限制: {}", methodName, rateLimit.qps());
+                // 打的是注解上的值，不是实际生效值——动态覆盖发生在 Lua 里，切面拿不到。
+                // 所以这里标明「注解」，避免有人拿着这个数去和 /config 的输出对不上。
+                log.warn("接口被限流: {} | 注解配置的QPS: {}（实际生效值可能被动态覆盖，见 GET /config）",
+                        methodName, rateLimit.qps());
                 return limited(joinPoint, rateLimit);
         }
     }

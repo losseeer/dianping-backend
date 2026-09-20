@@ -78,6 +78,14 @@ curl -s -u admin:admin \
   不是"只有 50 条不严重"。gauge 读的是上一轮扫描的内存快照，抓取间隔调密也不会更准。
 - **`$__rate_interval` 依赖 15s 抓取间隔**。数据源里显式写了 `timeInterval: "15s"`，
   改 `scrape_interval` 时两边都要改。
+- **`rejected` 计数不知道当前生效的是哪个阈值**。限流阈值的动态覆盖发生在 `rate-limit.lua`
+  里，切面拿不到生效值（日志打的是注解上的那个数）。半夜看到 `rejected` 涨起来，
+  先 `GET /config` 对一下 `override / effectiveQps`，再决定是不是流量真的变大了 ——
+  另一个常见答案是"白天有人改了阈值忘了改回来"。
+- **`last_scan_age_seconds` 量的是调度心跳，不是扫描间隔**。心跳在门控之前打，
+  所以把间隔调到合法上限 10s 它也还是毫秒级。这条正好是它的用途：`>30s` 说明
+  **调度器本身没在跑**（线程池饿死、实例假死），而不是"间隔被人调大了"。
+  间隔调大会影响的是 `oldest_age_seconds`（快照最长可能旧 10s），那是另一条规则。
 
 ## 验证状态（2026-09-19）
 
@@ -96,9 +104,17 @@ python3 check-queries.py grafana/dashboards/dianping-overview.json /tmp/scrape.t
   `/shop/search` 就能凑出 CLOSED→OPEN）、`dianping_outbox_{pending,oldest_age_seconds,last_scan_age_seconds}`、
   `executor_*{name="cache-rebuild"}`，以及 `uri` 标签的真实形状
   （`/voucher-order/seckill/{id}`、`/shop/{id}`、`/shop/search`）和 69 个 `le` 桶。
+- **已实测存在（ES_SYNC 事件）**：`dianping_outbox_event_total{result="failed",type="ES_SYNC"}`。
+  应用起着、ES 停着时改一次商铺就必出这条 —— 顺带说明这个计数器的"值"比"名字"更有用：
+  `type` 标签是这一档事件的健康度入口。`result="sent"` 要 ES 起着才能观测。
+- **动态扫描间隔靠单测锁，不靠面板**：`TransactionOutboxPublisherScanIntervalTest` 断言
+  「被门控跳过的那一轮一次 DB 都不碰，但心跳照打」。实机只测了投递延迟（间隔 10000ms 时
+  一条探针事件 8.87s 被拿走、200ms 时 0.27s，见 `docs/backend-design.md` §5.4），
+  没有专门去抓 `last_scan_age_seconds` 的曲线 —— 上面那条"心跳与间隔解耦"是按代码读出来的。
 - **只核过名字与标签、值还是空的**：`dianping_seckill_precheck_total{reason="ok"}`
   （要真下成一单）、`dianping_rate_limit_total{outcome="unavailable_rejected"}`
-  （要真的把 Redis 停掉）、`dianping_outbox_event_total`、`dianping_outbox_stuck_recovered_total`。
+  （要真的把 Redis 停掉）、`dianping_outbox_event_total` 的其余 `type/result` 组合、
+  `dianping_outbox_stuck_recovered_total`。
   这几个不制造对应故障就出不来，而面板上它们本来就该是空的 —— 恰恰是"出现即有问题"的那几个。
 - **没跑过的**：`docker compose up` 本身。写这套文件时本机的 Docker daemon 没在跑，
   所以 Prometheus / Grafana 两个容器的实际启动、`/targets` 是否 UP、Grafana 是否真的加载了

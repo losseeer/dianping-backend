@@ -148,11 +148,14 @@ class RedisRateLimiterTest {
     // ---------------------------------------------------------------- KEYS / ARGV 契约
 
     @Test
-    @DisplayName("KEYS 恰为一个，且带 ratelimit:api: 前缀 + 全限定方法名")
-    void buildsExactlyOneKeyWithPrefix() {
+    @DisplayName("KEYS 恰为两个：桶 + 规则键，都在各自的命名空间下 + 全限定方法名")
+    void buildsBucketAndRuleKeys() {
         limiterReturning(1L).tryAcquire(METHOD_KEY, QPS);
 
-        assertEquals(Arrays.asList(RedisConstants.RATE_LIMIT_API_KEY + METHOD_KEY), capturedKeys.get());
+        assertEquals(Arrays.asList(
+                RedisConstants.RATE_LIMIT_API_KEY + METHOD_KEY,
+                RedisConstants.RATE_LIMIT_RULE_KEY + METHOD_KEY), capturedKeys.get(),
+                "顺序不能反：脚本里 KEYS[1] 是桶、KEYS[2] 是规则，换过来就是「拿规则键当桶写」");
     }
 
     @Test

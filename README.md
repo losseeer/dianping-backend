@@ -19,8 +19,10 @@
 2. **秒杀链路**：Lua 原子预检（库存 + 一人一单）→ Redis Stream 异步落库（消费者组 ACK/XCLAIM 故障转移）→ 死信队列 30 分钟超时取消
 3. **订单状态机 + 支付闭环**：`UNPAID→PAID→VERIFIED / REFUNDING→REFUNDED` 六态状态机；取消与支付竞态由条件 UPDATE 裁决；`tb_pay_log` 流水幂等 + 迟到支付自动原路退款
 4. **DB 兜底约束**：`uk_active_user_voucher` / `uk_pending_order` 终态置 NULL 的部分唯一索引，从存储层杜绝超卖与重复支付
-5. **Outbox 模式**：支付通知、退款、Redis 补偿等跨链路消息先随业务事务落库，再由 publisher 轮询投递，保证事务与消息最终一致；退避重试封顶后仍失败的事件超过 `max-retry`（默认 20 次 ≈ 70 分钟）判定为死信（`status=3`）停止重试，整行留在表里供人工核对重放
+5. **Outbox 模式**：支付通知、退款、Redis 补偿、ES 增量同步等跨链路消息先随业务事务落库，再由 publisher 轮询投递，保证事务与消息最终一致；退避重试封顶后仍失败的事件超过 `max-retry`（默认 20 次 ≈ 70 分钟）判定为死信（`status=3`）停止重试，整行留在表里供人工核对重放
 6. **搜索熔断降级**：ES 检索失败时熔断打开并回退 MySQL LIKE 兜底；`synonym_graph` 放在 search analyzer 侧，同义词热更新无需重建索引
+7. **ES 与 MySQL 的一致性**：商铺写事务内投 `ES_SYNC` 事件，publisher 异步**回查 MySQL** 落索引（行已删除则删文档），`POST /shop/search/rebuild-index` 做全量对账 —— 索引不再靠重启重导，也不会静默漂移
+8. **运行期动态配置（零重启）**：限流阈值与 Outbox 扫描间隔都放进 Redis 配置源（`config:` 前缀），`/config` 一组接口读写字面量，`GET /config` 同时回显「注解默认值 / 覆盖值 / 实际生效值」三列。阈值覆盖在 `rate-limit.lua` 里读，所以"换阈值"和"扣令牌"是同一个原子动作
 
 ## 快速开始
 

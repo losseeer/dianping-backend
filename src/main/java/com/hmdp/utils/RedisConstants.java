@@ -105,4 +105,40 @@ public class RedisConstants {
      * TTL 由脚本固定为 2 秒，见 rate-limit.lua 末尾的推导。
      */
     public static final String RATE_LIMIT_API_KEY = "ratelimit:api:";
+
+    // ========== 运行期动态配置（改完立刻生效，不重启） ==========
+
+    /**
+     * 动态配置命名空间前缀 —— String，value 是纯数字文本
+     *
+     * <p>
+     * 【为什么单独开一个前缀而不是塞进各自的业务键】
+     * 这一族键的唯一作用是「覆盖代码里的默认值」，读法、写法、校验、可观测口径都一致，
+     * 放在一起才能用一个 {@code GET /config} 看全「当前哪些默认值被改了什么」。
+     *
+     * <p>
+     * 【铁律：只存「运行期取来的值」，绝不存「已写进别处的值的副本」】
+     * 反例就是把 qps 塞进令牌桶 Hash —— 改配置时旧键里的旧值会静默覆盖新配置，
+     * 而且 TTL 一到规则跟着桶一起消失。这里的键只被读取、不被任何写入方回填，
+     * 所以它永远是唯一事实源；删掉它 = 回到注解默认值，而不是回到某个陈旧副本。
+     */
+    public static final String DYNAMIC_CONFIG_KEY = "config:";
+
+    /**
+     * 接口限流阈值的运行期覆盖 —— String，value = qps（double，必须 &gt;= 1）
+     * 完整key: config:ratelimit:rule:{全限定类名.方法名}
+     *
+     * 由 rate-limit.lua 作为 KEYS[2] 直接读取（不在 Java 侧读：热路径不许多一次 RTT，
+     * 而且规则和桶必须在同一个原子脚本里生效）。注解上的 qps 退化为「没配规则时的默认值」。
+     */
+    public static final String RATE_LIMIT_RULE_KEY = DYNAMIC_CONFIG_KEY + "ratelimit:rule:";
+
+    /**
+     * Outbox 发布器的扫描间隔（毫秒）—— String，value = 正整数，取值范围见 DynamicConfig
+     * 完整key: config:outbox:publish-interval-ms
+     *
+     * 为什么需要它：积压 5 万条时想立刻把间隔调到 200ms 追平，用注解值就得改配置重启，
+     * 而重启本身又要重新预热缓存 —— 为一个开关付一次全量重启不值。
+     */
+    public static final String OUTBOX_PUBLISH_INTERVAL_KEY = DYNAMIC_CONFIG_KEY + "outbox:publish-interval-ms";
 }

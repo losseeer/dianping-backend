@@ -9,7 +9,7 @@ import com.hmdp.entity.Shop;
  * Shop(MySQL) → ShopDoc(ES) 统一转换器。
  *
  * 全项目只允许这一条转换路径：全量重建（ElasticsearchConfiguration.importAllShops）
- * 与增量写入（ShopSearchServiceImpl.syncShopToEs / importShop）必须产出一致的数据，
+ * 与增量写入（ShopSearchServiceImpl.syncShopById / syncShopToEs / importShop）必须产出一致的数据，
  * 否则重建索引和增量更新后同名商铺的 score 等字段会出现两套值，搜索排序漂移。
  *
  * 注意 score 直接透传：tb_shop.score 本身就是"评分×10"的整数（见 001_core.sql 建表注释），

@@ -86,6 +86,18 @@ management:
 payment:
   # Public callbacks remain disabled until this environment variable is configured.
   callback-secret: ${PAYMENT_CALLBACK_SECRET:}
+transaction:
+  outbox:
+    # 【publish-interval-ms 现在只是「默认值」，不是实际的调度周期】
+    # 真正的 fixedDelay 是 200ms 的地板 tick，每轮再按这里的间隔门控（Spring 5.2 没有
+    # 自适应 trigger，只能这么搭）。运行期改它不用重启：
+    #   PUT /config/outbox-interval?ms=3000   → 写 Redis，下一轮 tick 起生效
+    #   DELETE /config/outbox-interval        → 回到下面这个值
+    # 合法区间 [200, 10000]ms，上限的理由见 DynamicConfig#MAX_INTERVAL_MS。
+    publish-interval-ms: 1000
+    # 一条事件最多重试几轮，超过即置为死信（status=3）等人工核对重放。
+    # 退避是 min(2^retry, 300) 秒，20 次约合 70 分钟的重试预算。
+    max-retry: 20
 sms:
   # 验证码发送限流（Redis + Lua，见 SmsRateLimiter / sms-rate-limit.lua）
   # 【约束】cooldown-seconds 必须 < 验证码自身的 TTL（UserServiceImpl 里写死 2 分钟），

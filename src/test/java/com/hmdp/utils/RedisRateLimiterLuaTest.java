@@ -10,6 +10,7 @@ import org.springframework.data.redis.connection.DataType;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import javax.annotation.Resource;
+import java.util.Arrays;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -47,6 +48,7 @@ class RedisRateLimiterLuaTest {
 
     private static final String METHOD_KEY = "com.hmdp.test.LuaProbe.method";
     private static final String BUCKET_KEY = RedisConstants.RATE_LIMIT_API_KEY + METHOD_KEY;
+    private static final String RULE_KEY = RedisConstants.RATE_LIMIT_RULE_KEY + METHOD_KEY;
 
     @Resource
     private RedisRateLimiter redisRateLimiter;
@@ -54,10 +56,11 @@ class RedisRateLimiterLuaTest {
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    /** 规则键和桶键都要清：只清桶的话，上一条用例配的 qps 会漏到下一条里 */
     @BeforeEach
     @AfterEach
     void cleanBucket() {
-        stringRedisTemplate.delete(BUCKET_KEY);
+        stringRedisTemplate.delete(Arrays.asList(BUCKET_KEY, RULE_KEY));
     }
 
     @Test
@@ -180,6 +183,86 @@ class RedisRateLimiterLuaTest {
         assertTrue(allowed.get() <= upperBound,
                 "放行数 " + allowed.get() + " 超过上界 " + upperBound
                         + "（耗时 " + elapsedMs + "ms）—— check-and-set 未做到原子");
+    }
+
+    // ---------------------------------------------------------------- 运行期阈值覆盖（KEYS[2]）
+
+    @Test
+    @DisplayName("规则键存在时按覆盖值建冷桶：qps 参数被忽略，桶容量也跟着变小")
+    void overrideDefinesBothRateAndCapacity() {
+        stringRedisTemplate.opsForValue().set(RULE_KEY, "2");
+
+        // 传进来的注解值是 50，但规则说 2 —— 冷桶就该只有 2 个令牌
+        int allowed = 0;
+        for (int i = 0; i < 10; i++) {
+            if (redisRateLimiter.tryAcquire(METHOD_KEY, 50) == RedisRateLimiter.Outcome.ALLOWED) {
+                allowed++;
+            }
+        }
+        assertTrue(allowed <= 4, "覆盖成 2 之后不该放行接近 50 个，实际放行 " + allowed);
+        assertTrue(allowed >= 2, "冷桶至少要有覆盖值那么多令牌，实际放行 " + allowed);
+    }
+
+    @Test
+    @DisplayName("把阈值调小：桶里攒着的旧令牌当场被夹掉，不用等它自然耗尽")
+    void loweringTheRuleClampsExistingTokens() {
+        // 先按 50 攒一个满桶（只消耗 1 个，还剩约 49）
+        assertEquals(RedisRateLimiter.Outcome.ALLOWED, redisRateLimiter.tryAcquire(METHOD_KEY, 50));
+
+        stringRedisTemplate.opsForValue().set(RULE_KEY, "3");
+
+        int allowed = 1;
+        for (int i = 0; i < 60; i++) {
+            if (redisRateLimiter.tryAcquire(METHOD_KEY, 50) == RedisRateLimiter.Outcome.ALLOWED) {
+                allowed++;
+            } else {
+                break;
+            }
+        }
+        // 没有这道夹取的话这里是 49 —— 也就是"改了配置要等旧令牌流干才生效"。
+        // 上界给 6：夹取发生在每次调用的补充之后，几毫秒的调用间隔还能补出零点几个。
+        assertTrue(allowed <= 6,
+                "调小阈值后应立即夹住存量令牌，实际连续放行 " + allowed + " 个（含首个已消耗的）");
+    }
+
+    @Test
+    @DisplayName("规则键里是非法值：忽略它、按注解值走，脚本不报错")
+    void illegalRuleIsIgnoredNotFatal() {
+        // < 1 的规则会把接口打死（桶容量不足一个令牌），所以脚本选择忽略；
+        // 非数字同理。这条测的是"永远不会因为一个脏值而让接口 100% 拒绝"。
+        for (String dirty : Arrays.asList("0", "0.5", "-3", "abc", "")) {
+            cleanBucket();
+            stringRedisTemplate.opsForValue().set(RULE_KEY, dirty);
+
+            int allowed = 0;
+            for (int i = 0; i < 5; i++) {
+                if (redisRateLimiter.tryAcquire(METHOD_KEY, 5) == RedisRateLimiter.Outcome.ALLOWED) {
+                    allowed++;
+                }
+            }
+            assertTrue(allowed >= 4, "脏规则 " + dirty + " 应被忽略、按注解 qps=5 放行，实际 " + allowed);
+        }
+    }
+
+    @Test
+    @DisplayName("删掉规则键 = 立刻回到注解默认值，不留副本")
+    void removingTheRuleFallsBackToAnnotation() {
+        stringRedisTemplate.opsForValue().set(RULE_KEY, "1");
+        drain(1);   // 按覆盖值 1 把桶抽干
+        assertEquals(RedisRateLimiter.Outcome.REJECTED, redisRateLimiter.tryAcquire(METHOD_KEY, 5));
+
+        stringRedisTemplate.delete(RULE_KEY);
+
+        // 键没了就回到注解的 5：但桶里还是那个按 1 建的旧桶（tokens≈0），
+        // 所以这里断言的不是"立刻放行 5 个"，而是"下一批请求会按 5 补充"——等一秒足以补出 5 个。
+        sleep(1100);
+        int allowed = 0;
+        for (int i = 0; i < 5; i++) {
+            if (redisRateLimiter.tryAcquire(METHOD_KEY, 5) == RedisRateLimiter.Outcome.ALLOWED) {
+                allowed++;
+            }
+        }
+        assertTrue(allowed >= 4, "清除覆盖后应按注解 qps 补充，实际放行 " + allowed);
     }
 
     // ---------------------------------------------------------------- 辅助
