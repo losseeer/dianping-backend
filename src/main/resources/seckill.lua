@@ -37,6 +37,8 @@ local amount=ARGV[7]
 --1.8.链路追踪id（由HTTP线程取出后随消息一起原子落进Stream）
 local traceId=ARGV[8]
 if (traceId == nil) then traceId = 'none' end
+--1.9.全局对账索引的TTL（秒）—— 见3.9，远长于预订单TTL
+local reconcileIndexTtl=tonumber(ARGV[9])
 
 -- 2.数据key
 --2.1.库存key
@@ -45,6 +47,8 @@ local stockKey='seckill:stock:' .. voucherId
 local orderKey='seckill:order:' .. voucherId
 local pendingOrderKey='seckill:order:pending:' .. orderId
 local pendingUserKey='seckill:order:pending:user:' .. userId
+--2.3.全局预扣索引（对账任务专用；与具体订单无关的公共键，所以不带id后缀）
+local pendingIndexKey='seckill:order:pending:index'
 
 -- 3.脚本业务
 --3.1.判断库存是否充足
@@ -88,8 +92,21 @@ redis.call('expire',pendingUserKey,pendingTtl)
 -- traceId 一起进消息：这是全链路唯一能把"用户那次HTTP请求"和"几秒后异步落库"
 -- 接上的地方（Stream不像MQ有header，字段就是它的全部元数据）。
 -- 兜底成'none'而不是留空：XADD 传 nil 会直接报错，等于把整个原子脚本打死。
-redis.call('xadd','stream.orders','*',
+local streamEntryId=redis.call('xadd','stream.orders','*',
         'userId',userId,'voucherId',voucherId,'id',orderId,
         'createEpoch',createEpoch,'amount',amount,
         'traceId',traceId)
+-- 3.9. 全局预扣索引 —— 只给对账任务用，不参与任何下单判定
+-- 【八股：为什么光有预订单（3.7）不够用？】
+-- pendingOrderKey 只有10分钟TTL，而对账要看的正是"很久以前扣的、到现在还没落库"
+-- 的那批——到那时预订单JSON早已过期，恢复库存所需的 userId/voucherId 就只剩这里还留着。
+-- 【为什么member是四段拼接而不是只存orderId】
+-- 一个ZSet同时承担了"按时间排序扫描"(score)和"自带恢复参数"(member)两件事，
+-- 不必再开一个Hash存 orderId→订单信息。orderId/userId/voucherId 全是数字、
+-- entryId 形如 "1758522123456-0"，都不含冒号，所以分隔符是安全的。
+-- entryId 也记进来是为了让对账能反查"这条消息是不是还在Stream里"：
+-- 还在 = 消费者只是慢，绝不能回滚（详见 SeckillReservationReconciler）。
+redis.call('zadd',pendingIndexKey,createEpoch,
+        orderId .. ':' .. userId .. ':' .. voucherId .. ':' .. streamEntryId)
+redis.call('expire',pendingIndexKey,reconcileIndexTtl)
 return 0

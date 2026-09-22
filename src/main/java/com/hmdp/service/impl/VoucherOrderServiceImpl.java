@@ -263,7 +263,10 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 order.getAmount().toString(),
                 // traceId 随消息进 Stream：秒杀是"下单立即返回、订单几秒后才落库"的异步链路，
                 // 没有这一棒，用户报"我下单没成功"时消费端日志根本对不上是哪次请求。
-                traceId()
+                traceId(),
+                // 全局预扣索引的TTL：这一步不只是"发消息+发延迟消息"，还顺带把这次预扣
+                // 登记进对账索引（脚本3.9），供"扣了库存却永远没有订单"的残留被扫出来回滚。
+                String.valueOf(RedisConstants.SECKILL_PENDING_INDEX_TTL)
         );
         //2.判断结果是否为0（返回码约定见 SECKILL_SCRIPT 常量声明处）
         if (result == null) {

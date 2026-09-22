@@ -39,6 +39,32 @@ public class RedisConstants {
      */
     public static final String SECKILL_PENDING_USER_KEY = "seckill:order:pending:user:";
     public static final Long SECKILL_PENDING_USER_TTL = 10L;
+
+    /**
+     * 全局预扣索引 —— ZSet，member = {orderId}:{userId}:{voucherId}:{streamEntryId}，
+     * score = 下单 epoch 秒，由 seckill.lua 在预扣的同一次原子提交里写入。
+     *
+     * <p>
+     * 【它解决的是"前两道防线都失效"的那一段】预扣能不能走到落库，前面有三层自愈
+     * （PENDING 重读 / XCLAIM 认领 / 消费端幂等），但对账要回答的是另一个问题：
+     * <strong>"Redis 究竟有没有一笔扣了库存、却永远不会有订单的残留"</strong>。
+     * 这个问题只能靠一个跨订单维度的索引来扫，而 pending 预订单是按订单分片的、
+     * 且只有10分钟TTL，过期就再也找不回来了。详见 {@code SeckillReservationReconciler}。
+     *
+     * <p>
+     * 【为什么member是四段拼接】见 seckill.lua 3.9 的注释：一个 ZSet 兼任排序与载荷。
+     */
+    public static final String SECKILL_PENDING_INDEX_KEY = "seckill:order:pending:index";
+
+    /**
+     * 全局预扣索引的 TTL（秒）。
+     *
+     * 【它为什么必须远大于对账窗口】索引里每一条都自带删除时机——被对账任务确认之后 ZREM。
+     * 这个 TTL 只是"对账任务长期停摆"时的内存兜底，绝不能小于对账窗口：
+     * 否则一条本该被回滚的残留会在等到对账扫到它之前，先跟着整个键一起过期消失。
+     * 当前 2 小时 vs 对账窗口 15 分钟，留了 8 倍余量。
+     */
+    public static final Long SECKILL_PENDING_INDEX_TTL = 2 * 60 * 60L;
     public static final String BLOG_LIKED_KEY = "blog:liked:";
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";
