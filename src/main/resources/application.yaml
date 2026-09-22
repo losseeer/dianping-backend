@@ -98,6 +98,25 @@ transaction:
     # 一条事件最多重试几轮，超过即置为死信（status=3）等人工核对重放。
     # 退避是 min(2^retry, 300) 秒，20 次约合 70 分钟的重试预算。
     max-retry: 20
+seckill:
+  # 预占对账（SeckillReservationReconciler）—— 最后一张网。
+  # 消费端那四层可靠性（PENDING 重读 / XCLAIM 认领 / 消费端幂等 / 毒丸终点）全都建立在
+  # "消息还在 Stream 或 PENDING 里"这个前提上，管不到"Redis 扣了库存却永远不会有订单"
+  # 的那一段。对账专门收这一段的尾：还库存、还一人一单资格。
+  reconcile:
+    # 对账窗口：只处理"预扣已发生超过这么久"的登记。
+    # 【约束一】不能小于预订单可见窗口（SECKILL_PENDING_ORDER_TTL，10分钟），
+    #   否则窗口内本来就还在途的预占会被误判成残留回滚掉。
+    # 【约束二】必须小于 SECKILL_PENDING_INDEX_TTL（2小时），否则索引登记会在等到对账
+    #   之前先过期，任务静默空转（启动时会打 ERROR 告警，但不会拦下启动）。
+    horizon-seconds: 900
+    # 单轮最多处理多少条。积压几万条说明出的是别的问题，靠它救不回来。
+    batch-size: 100
+    # 扫描间隔：这是启动期绑定的值，不像 outbox.publish-interval-ms 那样支持运行期改
+    # （对账是低频兜底，五分钟还是十分钟扫一轮没有实质区别）。
+    interval-ms: 300000
+    # 首次延迟：应用刚起来时消费线程可能还在追赶积压，立刻对账等于在系统最忙的时候动手。
+    initial-delay-ms: 60000
 sms:
   # 验证码发送限流（Redis + Lua，见 SmsRateLimiter / sms-rate-limit.lua）
   # 【约束】cooldown-seconds 必须 < 验证码自身的 TTL（UserServiceImpl 里写死 2 分钟），
