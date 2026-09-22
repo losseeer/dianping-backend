@@ -116,6 +116,13 @@ python3 check-queries.py grafana/dashboards/dianping-overview.json /tmp/scrape.t
   （要真的把 Redis 停掉）、`dianping_outbox_event_total` 的其余 `type/result` 组合、
   `dianping_outbox_stuck_recovered_total`。
   这几个不制造对应故障就出不来，而面板上它们本来就该是空的 —— 恰恰是"出现即有问题"的那几个。
+- **`dianping_seckill_{consumer,reconcile}_total` 比上面那一档更弱一档**：它们没进过
+  真实抓取，只有测试里走通的证据 —— 单测与真机测试断言的是 Micrometer 计数器本身
+  （`SimpleMeterRegistry` 里按 result 标签取到的值），而 Prometheus 侧的名字
+  （`dianping.seckill.consumer` → `dianping_seckill_consumer_total`）是按既有约定推的，
+  与 `dianping_outbox_event` → `dianping_outbox_event_total` 同源但没被实测核对过。
+  起一次应用、下一单跑到落库，再跑 `check-queries.py` 就能把这一档补上。
+  各标签值的含义见 `docs/backend-design.md` §10.1。
 - **没跑过的**：`docker compose up` 本身。写这套文件时本机的 Docker daemon 没在跑，
   所以 Prometheus / Grafana 两个容器的实际启动、`/targets` 是否 UP、Grafana 是否真的加载了
   这个 JSON，都属于"待你起一次"的状态。能静态验证的都验证了：compose 过了
@@ -124,7 +131,7 @@ python3 check-queries.py grafana/dashboards/dianping-overview.json /tmp/scrape.t
 
 ## 不含
 
-- **Alertmanager**：`prometheus/alerts/dianping.yml` 定义了 7 条规则并会真的评估，
+- **Alertmanager**：`prometheus/alerts/dianping.yml` 定义了 10 条规则并会真的评估，
   但没有推送出口 —— "告警"在这里指 `/alerts` 页面变红和面板上的阈值线。
   要推送就加一个 alertmanager 服务并填 `prometheus.yml` 的 `alerting.alertmanagers`。
 - **日志/追踪后端**：traceId 目前只在单进程的日志里（Phase 2），没有 Loki/Tempo/Jaeger，
