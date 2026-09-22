@@ -214,30 +214,46 @@ src/main/java/com/hmdp/
 ```
 用户点击秒杀
   ↓
-1. Redis + Lua 原子预检（seckill.lua）
-   ├─ 判断 Redis 库存 > 0 → 否则返回 1（库存不足）
-   ├─ 判断 Set 中是否已有 userId → 是则返回 2（一人一单）
-   ├─ 扣减 Redis 库存（INCRBY stockKey -1）
-   └─ SADD userId 到 Set → 返回 0（成功）
+1. 前置校验（VoucherOrderServiceImpl.seckillVoucher）
+   ├─ 券是否存在 / 秒杀时间窗 / 支付金额是否合法
+   └─ ensureRedisStock：SETNX 预热 Redis 库存（只在冷启动写入，绝不覆盖已扣减的值）
   ↓
 2. RedisIdWorker 生成 orderId（时间戳 + 自增序列）
   ↓
-3. 发送 RabbitMQ 消息到 X 交换机（路由 XA → QA 队列）
-   ↓ 消息体：VoucherOrder JSON
-4. SeckillVoucherListener 异步消费
-   ├─ save(voucherOrder) 落库 DB
-   ├─ seckillVoucherService.update() setSql("stock = stock - 1") where voucher_id=? and stock>0
-   │   ── 乐观锁：仅 stock>0 时才扣减，防超卖
-   └─ sendOrderDelayMessage(orderId) → 发送延迟消息到 ORDER_DELAY_QUEUE（TTL 30min）
+3. Redis + Lua 原子预检 + 投递（seckill.lua，一次 RTT 内完成全部判定与写入）
+   ├─ 判断 Redis 库存 > 0 → 否则返回 1（库存不足）
+   ├─ 判断 Set 中是否已有 userId → 是则返回 2（一人一单）
+   ├─ 扣减 Redis 库存（INCRBY stockKey -1）+ SADD userId（占用一人一单资格）
+   ├─ SET pending 预订单 + ZADD 用户维度索引（TTL 10min，覆盖异步落库窗口期的查询）
+   ├─ XADD stream.orders   ← 订单事件与扣减在同一次原子提交里，不存在"扣了库存但没发出去"
+   └─ ZADD 全局预扣索引（供下面那条旁路对账）→ 返回 0（成功）
   ↓
-5. 30min 后消息过期 → 死信交换机 ORDER_DEAD_EXCHANGE → ORDER_CANCEL_QUEUE
+4. 立即返回 orderId。用户侧的"秒杀成功"到此为止，落库是异步的
   ↓
-6. OrderDelayListener 消费
-   └─ voucherOrderService.handleOrderTimeout(orderId)
-       ├─ 查订单状态
-       ├─ 仍是 UNPAID → 更新为 CANCELLED + restoreStockAndOrderRecord（Redis INCR + DB stock+1 + SREM userId）
-       └─ 已 PAID → 忽略（用户已支付，幂等保护）
+5. SeckillVoucherListener 异步消费（Redis Stream 消费者组 g1，单线程）
+   ├─ Redisson 锁 lock:order:{userId}:{voucherId} + 订单主键存在性检查 ── 消费端幂等
+   ├─ 乐观锁扣 DB 库存：update set stock=stock-1 where voucher_id=? and stock>0（防超卖）
+   ├─ save(voucherOrder) 落库 + 清 pending 缓存
+   ├─ sendOrderDelayMessage(orderId) → ORDER_DELAY_QUEUE（TTL 30min，按下单时刻扣减已流逝时间）
+   └─ XACK + XDEL；异常则留在 PENDING，由三层兜底：重读自己的 PENDING（处理中失败）/
+      XCLAIM 认领其他实例遗留（实例崩溃）/ 毒丸终点（投递 120 次≈10min 后回滚预占）
+  ↓
+6. 30min 后消息过期 → 死信交换机 ORDER_DEAD_EXCHANGE → ORDER_CANCEL_QUEUE
+  ↓
+7. OrderDelayListener 消费 → voucherOrderService.handleOrderTimeout(orderId)
+   ├─ 查订单状态（DB 查不到时回落到 pending 预订单，覆盖异步落库延迟）
+   ├─ 仍是 UNPAID → 置为 CANCELLED + 恢复 DB 库存 + 登记 Outbox 补偿 Redis 库存与一人一单资格
+   └─ 已 PAID → 忽略（用户已支付，幂等保护）
+
+旁路：SeckillReservationReconciler 定时对账（不在这条主链路上）
+   └─ 扫全局预扣索引，把"DB 无订单 且 消息已不在 Stream 里"的残留回滚：还库存、还资格
 ```
+
+> 上面 1～7 步是「下单 → 支付/超时取消」的主链路，最后那条旁路是兜底。主链路的四层可靠性
+> （正常 ACK / 重读自己的 PENDING / XCLAIM 认领 / 毒丸终点）**全都以"消息还在 Stream 或
+> PENDING 里"为前提**，管不到两类情况：消息永远处理不成功，以及预扣成了孤儿（Redis 丢数据、
+> 消息被丢弃或手工删除）。这两类只能靠跨订单维度的对账来发现——它比死信更值得关注，
+> 因为这条路径上连一条失败日志都不会有。指标与告警口径见 §10.1。
 
 **关键技术决策**：
 
@@ -247,6 +263,8 @@ src/main/java/com/hmdp/
 | **异步落 DB** | DB 单行写 QPS 约 1k~3k，Redis 单 key 写可达 80k+；异步落库把峰值削平 |
 | **死信回滚** | 防止用户抢到券但不支付一直占坑；TTL 30min 自动取消 + 恢复库存 |
 | **消费端 Redisson 锁兜底** | 消息可能重复投递（网络抖动 ack 失败），消费端用 `lock:order:{userId}` 防重复下单 |
+| **重试必须有终点** | 永久失败的消息如果无限重投，代价是确定的（库存永久少 1、一个用户被永久挡住资格），收益是不确定的。投递次数到顶（120 次 ≈ 10 分钟，与预订单可见窗口对齐）即回滚预占并移出循环 |
+| **对账是最后一张网** | Outbox 能保证"业务变更+消息"原子，靠的是同库同事务；预扣在 Redis、订单在 MySQL，没有共享事务，那道缝只能靠对账缝上。判据必须是"DB 无订单 **且** 消息已不在 Stream 里"，否则会把在途消息的库存提前还回去，等它被消费成功就是同一份库存卖了两次 |
 | **乐观锁防超卖** | `update set stock=stock-1 where voucher_id=? and stock>0`，MySQL 行锁保证只有一个线程扣减成功 |
 | **@Lazy 打破循环依赖** | VoucherOrderService 依赖 PaymentService，PaymentService 又依赖 VoucherOrderService；用 @Lazy 注入 CGLIB 代理，延迟真实依赖解析 |
 
@@ -708,9 +726,13 @@ curl -s -X PUT -H "authorization: $TOKEN" "http://127.0.0.1:8081/config/outbox-i
 
 ```
 秒杀异步下单：
+  【已不在 RabbitMQ 上】订单事件由 seckill.lua 在与库存扣减的同一次原子提交里
+  XADD 进 Redis Stream（stream.orders），由 SeckillVoucherListener 消费，见 §3.3。
+  下面这组队列是教程遗留的 TTL + 死信演示，QueueConfig 仍在声明，但已无任何发送方：
+
   X (DirectExchange) ──[XA]──→ QA (TTL 10s) ──[死信]──→ Y (DirectExchange) ──[YD]──→ QD
-                                                                                    ↓
-                                                                            SeckillVoucherListener.receivedD (兜底)
+                                                          （无消费者：QD 上的消费
+                                                             随旧实现一并删除了）
 
 订单延迟取消：
   ORDER_DELAY_EXCHANGE ──[order.delay]──→ ORDER_DELAY_QUEUE (TTL 30min)
@@ -723,7 +745,7 @@ curl -s -X PUT -H "authorization: $TOKEN" "http://127.0.0.1:8081/config/outbox-i
   PAY_NOTIFY_EXCHANGE ──[pay.notify]──→ PAY_NOTIFY_QUEUE → PayNotifyListener
 
 退款：
-  REFUND_EXCHANGE ──[refund]──→ REFUND_QUEUE → 退款消费者
+  REFUND_EXCHANGE ──[refund]──→ REFUND_QUEUE → PayNotifyListener（同一容器里的第二个 @RabbitListener）
 ```
 
 ### 7.2 死信队列三种来源（八股）
@@ -834,7 +856,7 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 
 指标出口：`GET /actuator/prometheus`（Micrometer + Prometheus 文本格式，无需登录，见 `MvcConfig` 白名单）。
 
-采集与看板在 `observability/`：`docker compose up -d` 起 Prometheus（127.0.0.1:9090）+ Grafana（127.0.0.1:3000，目录「点评后端」，面板 uid `dianping-overview`）。JSON 里的每条查询、`prometheus/alerts/dianping.yml` 里的 7 条告警规则，与下表是同一套口径，改这里要同步改那里。
+采集与看板在 `observability/`：`docker compose up -d` 起 Prometheus（127.0.0.1:9090）+ Grafana（127.0.0.1:3000，目录「点评后端」，面板 uid `dianping-overview`）。JSON 里的每条查询、`prometheus/alerts/dianping.yml` 里的 10 条告警规则，与下表是同一套口径，改这里要同步改那里。
 
 | 指标 | 估算区间 | 测试方法 |
 |---|---|---|
@@ -854,6 +876,8 @@ Java 与 Agent 共用同一 Redis 实例，按 Key 前缀划分：
 - Outbox 死信看 `increase(dianping_outbox_event_total{result="dead"}[1h])`：出现即说明有事件重试耗尽（永久失败，例如补偿目标已不存在），需要人工决定重放还是废弃；`dianping_outbox_stuck_recovered_total` 则对应"实例在已抢占未投递之间死掉过"。
 - 熔断器与限流的 outcome 是**必拆的**：`rejected` 与 `unavailable_rejected` 对客户端是同一个响应体，只有指标能区分"限流生效"和"Redis 挂了导致失败关闭"。
 - **所有 `dianping_*` 指标都是懒注册的**：没走过的代码路径不会有序列，面板上的 No data 不等于 0。同理，被 `@RateLimit` 挡在切面外层的请求不会进 `dianping_seckill_precheck_total`，所以"预检 QPS"永远 ≤ 接口 QPS，两者的差就是限流拦掉的那部分。
+- **秒杀消费结果（`dianping_seckill_consumer_total{result}`）里只有两种是"永久失败"**：`dead_letter`（重试 120 次 ≈ 10 分钟后仍失败，已回滚预占）与 `discarded`（消息字段非法被丢弃，预占交由对账回收）。`rejected_active_order` / `rejected_out_of_stock` 是消费端**主动**拒绝且已妥善处理，业务上正常——尤其 `rejected_out_of_stock` 表示 Redis 库存领先于 DB，此时刻意不回滚，让缓存向 DB 收敛（回滚反而会造成 Redis 超卖）。`failed` 是正在重试，它只是通往 `dead_letter` 的中间态，单独看没有意义。
+- **预占对账（`dianping_seckill_reconcile_total{result}`）里 `in_flight` 是唯一能反映"消费者停摆"的信号**：消费端正常时落库是秒级的，所以一条消息超过对账窗口（15 分钟）仍留在 Stream 里，说明消费线程卡住或实例根本没跑。这条路径上不会打任何 `failed` 日志（消息没被处理过就谈不上失败），死信规则也不会响（没有失败，只有不处理）——不看这个数就是完全静默。反过来 `reverted` 比死信更值得看：它意味着某条消息压根没被消费到（Redis 丢数据 / 消息被手工删除），对账是唯一发现得了它的地方。
 - **异步落库收敛时间仍测不出来**：秒杀走 Redis Stream，消费端没有埋耗时指标，"500 单约 4 秒落库"这类数只能轮询 DB（`stress/verify.sh`）。这是当前观测面的一个真实缺口 —— 想补就给它加一个 `Timer`，别再靠日志时间戳相减。
 
 ### 10.2 横向扩展预留
@@ -921,7 +945,7 @@ grep 'my-debug-01' app.log      # HTTP 线程 + seckill-order-consumer + MQ 容�
 5. **支付风控**：接入第三方风控（设备指纹、行为分析），PaymentService.payOrder 前置风控检查
 6. **秒杀预热**：秒杀活动开始前把库存预热到 Redis，避免活动开始瞬间 DB 压力
 7. **接口幂等 token**：秒杀接口前置 `GET /voucher-order/token` 获取幂等 token，提交时校验，防重复提交
-8. **链路追踪**：指标出口（`/actuator/prometheus`，§10.1）、本地采集栈（`observability/`：Prometheus + Grafana 面板 + 7 条告警规则）与单机 traceId 贯通（§10.3）已落地，切换点覆盖 HTTP / Redis Stream / RabbitMQ / 线程池 / `@Scheduled` 五类。剩下的都是"跨进程"那一档：① Agent 微服务是这套接口的调用方，它只要在请求里带上 `X-Trace-Id`，两边日志就能并到一条链上——机制在本仓库已经就绪，缺的是 Agent 侧那段改动的约定；② 采样、拓扑图、按服务聚合的 P99 需要 SkyWalking / Jaeger 这类专门组件，单靠 MDC 不再往上加
+8. **链路追踪**：指标出口（`/actuator/prometheus`，§10.1）、本地采集栈（`observability/`：Prometheus + Grafana 面板 + 10 条告警规则）与单机 traceId 贯通（§10.3）已落地，切换点覆盖 HTTP / Redis Stream / RabbitMQ / 线程池 / `@Scheduled` 五类。剩下的都是"跨进程"那一档：① Agent 微服务是这套接口的调用方，它只要在请求里带上 `X-Trace-Id`，两边日志就能并到一条链上——机制在本仓库已经就绪，缺的是 Agent 侧那段改动的约定；② 采样、拓扑图、按服务聚合的 P99 需要 SkyWalking / Jaeger 这类专门组件，单靠 MDC 不再往上加
 9. **秒杀落库耗时指标**：`dianping_seckill_precheck_total` 只计到"预检放行"，Stream 消费端没有埋耗时，所以"500 单约 4 秒落库"这个数至今只能靠轮询 DB 得到（`stress/verify.sh`）。补法是在 `SeckillVoucherListener` 上挂一个 `Timer`，并用消息里已有的 `createEpoch` 字段单独计"预订单在 Stream 里等了多久"——后者才是用户真正感知的延迟。这是当前观测面最大的一个缺口
 
 ---

@@ -43,6 +43,44 @@ groups:
         annotations:
           summary: "15 分钟内回收了 {{ $value | printf \"%.0f\" }} 条卡在发送中的事件"
 
+  - name: dianping-seckill
+    rules:
+      - alert: SeckillOrderDeadLetterAppeared
+        # 秒杀消息的四种结局里，只有这两种是"永久失败"：dead_letter 是重试 120 次
+        # （预留约 10 分钟预算）后仍失败并已回滚预占，discarded 是字段非法被丢弃。
+        # 共同点是用户已经看到过「秒杀成功」，但那笔订单永远不会创建。它不会自愈。
+        expr: increase(dianping_seckill_consumer_total{result=~"dead_letter.*|discarded"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "秒杀消息永久失败（1h 内 {{ $value | printf \"%.0f\" }} 条）"
+          description: "result={{ $labels.result }}。dead_letter 已回滚预占；discarded 的预占由对账回收。查 orderId 后决定补单还是让用户重下。"
+
+      - alert: SeckillReservationReverted
+        # 对账每回滚一次 = Redis 里确认了一笔"扣了库存却不会有订单"的残留。
+        # 这比死信更值得看：它意味着某条消息根本没被消费到（Redis 丢数据 / 消息被手工删除 /
+        # 消费者从未收到），而这条路径上不会有任何一条 failed/dead 的日志。
+        expr: increase(dianping_seckill_reconcile_total{result="reverted"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "对账回滚了 {{ $value | printf \"%.0f\" }} 笔无主预占"
+          description: "对应这些券少卖了、且对应用户曾被挡住购买资格（现已释放）。偶发一条要查 Redis 持久化配置；持续出现要查消费者是否整批没跑。"
+
+      - alert: SeckillMessageStuckBeyondReconcileWindow
+        # 唯一的"消费端停摆"信号。消费端正常时秒级落库，所以一条消息在对账窗口(15分钟)
+        # 之后仍未落库 = 消费端落后到异常或根本没在跑。这条路径上不会打任何 failed 日志
+        # （消息没被处理过就谈不上失败），只有对账这一侧看得见。
+        expr: increase(dianping_seckill_reconcile_total{result="in_flight"}[30m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "有秒杀消息超过对账窗口仍未落库"
+          description: "对账扫到登记超时、但消息仍在 Stream 里，说明消费者只是慢——库存是安全的（对账刻意不回滚在途预占），要查的是 seckill-order-consumer 线程是否卡住或实例是否还在。"
+
   - name: dianping-protection
     rules:
       - alert: CircuitBreakerOpen

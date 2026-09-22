@@ -383,9 +383,85 @@
       }
     },
     {
+      "type": "timeseries",
+      "title": "消费结果分布",
+      "description": "created 是正常落库；rejected_* 是消费端主动拒绝并回滚（业务上正常：rejected_active_order 是重复单、rejected_out_of_stock 是 Redis 领先于 DB，后者刻意不回滚，让缓存库存向 DB 收敛）；failed 是正在重试，它的斜率决定多久会走到毒丸；dead_letter 与 discarded 是永久失败，非 0 就必须有人查。",
+      "id": 27,
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(dianping_seckill_consumer_total[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "custom": { "fillOpacity": 30, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "预占对账结果",
+      "description": "confirmed 是订单已落库、登记结清（绝大多数）；in_flight 是消息还在 Stream 里、消费者只是慢，对账刻意不碰它——这条持续走高说明消费端落后，但库存是安全的；reverted 是判定为无主预占并已回滚库存与资格；failed 是读库/读 Stream 失败、留待下轮；malformed 是索引脏数据。",
+      "id": 28,
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (rate(dianping_seckill_reconcile_total[$__rate_interval]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "cps", "custom": { "fillOpacity": 30, "lineWidth": 1 } },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "毒丸与预占回滚（1h）",
+      "description": "两个都不该安静地非 0。毒丸/丢弃 = 一条消息重试 120 次（约 10 分钟）后仍失败，对应一笔永远不会创建的订单；预占回滚 = 对账确认 Redis 里有一笔扣了库存却不会有订单的残留，对应这张券少卖了一张、且有人曾被挡住购买资格。",
+      "id": 29,
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "dianping-prom" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(dianping_seckill_consumer_total{result=~\"dead_letter.*|discarded\"}[1h])) or vector(0)",
+          "legendFormat": "毒丸/丢弃"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(dianping_seckill_reconcile_total{result=\"reverted\"}[1h])) or vector(0)",
+          "legendFormat": "预占回滚"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      }
+    },
+    {
       "type": "row",
       "title": "限流与熔断",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
       "id": 103,
       "collapsed": false,
       "panels": []
@@ -395,7 +471,7 @@
       "title": "限流 outcome by api",
       "description": "四个 outcome 必须拆开看：allowed 与 unavailable_allowed（Redis 挂了但 fail-open 放行）对客户端都是正常响应，rejected 与 unavailable_rejected 对客户端是同一个响应体，只有这里能区分「限流生效」和「Redis 挂了导致失败关闭」。",
       "id": 13,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -414,7 +490,7 @@
       "title": "熔断器状态 by api",
       "description": "0=CLOSED 1=HALF_OPEN 2=OPEN（编码刻意不用枚举 ordinal，见 CircuitBreakerAspect#stateCode）。抓取间隔 15s，一次完整的 OPEN→HALF_OPEN→CLOSED 抖动可能整个落在两次抓取之间 —— 所以要和下面「状态跃迁」一起看。",
       "id": 14,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -450,7 +526,7 @@
       "title": "降级原因分布",
       "description": "cause=open（熔断中直接降级）/ probe_in_progress（半开探测名额被占）/ failure（原方法抛异常后降级）。三者对客户端是同一个响应，但对定位是完全不同的三件事。",
       "id": 15,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 41 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -469,7 +545,7 @@
       "title": "滑动窗口内失败数",
       "description": "gauge，不是累计数：窗口过期会清零，所以它阶梯状是正常的。它到 openFailureThreshold 的 times 就是熔断触发点。",
       "id": 16,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 41 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -488,7 +564,7 @@
       "title": "熔断状态跃迁",
       "description": "to=OPEN 的速率就是「有几件事正在坏」；to=CLOSED 是恢复。用 counter 而不是 state gauge，正是为了抓住 15s 采样之间的抖动。",
       "id": 17,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 41 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -505,7 +581,7 @@
     {
       "type": "row",
       "title": "缓存",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
       "id": 104,
       "collapsed": false,
       "panels": []
@@ -515,7 +591,7 @@
       "title": "查缓存结果分布",
       "description": "hit 与 hit_plain 都是命中，区别在值格式：前者是逻辑过期信封 RedisData（预热写入），后者是 queryWithPassThrough 回填的裸 JSON + 物理 TTL。两种策略共用同一个 key，hit_plain 持续走高就说明热点 key 实际靠物理过期在撑、预热没到位（Phase 2 之前这里会 NPE 降级成 DB 查询）。",
       "id": 18,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 50 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -537,7 +613,7 @@
       "title": "命中率 by cache",
       "description": "按缓存前缀拆开，判断「整体命中率正常但某个 key 已经失效」这类情况。",
       "id": 19,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 50 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -561,7 +637,7 @@
       "title": "重建尝试",
       "description": "claimed=抢到锁 / skipped=锁被占（热点 key 过期瞬间只有一个赢家，正常）/ failed=重建任务抛异常。failed 与 stale_served 对着看才定位得准。",
       "id": 20,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 58 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 66 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -580,7 +656,7 @@
       "title": "重建线程池",
       "description": "逻辑过期重建用的自建线程池（ExecutorServiceMetrics 注册）。queued 长期不为 0 = 重建速度跟不上失效速度，用户就会持续读到 stale_served。",
       "id": 21,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 58 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 66 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -607,7 +683,7 @@
     {
       "type": "row",
       "title": "Outbox（事务性发件箱）",
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 74 },
       "id": 105,
       "collapsed": false,
       "panels": []
@@ -617,7 +693,7 @@
       "title": "投递结果 by type",
       "description": "sent / failed（还会重试）/ dead（永久失败）/ claim_lost（多实例 CAS 抢不到，正常）。type 取自库里的 eventType：PAY_NOTIFY、REFUND、REDIS_COMPENSATION。",
       "id": 22,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -636,7 +712,7 @@
       "title": "待发事件数（上一轮快照）",
       "description": "读的是内存快照，上限 BATCH_LIMIT=50，所以它「贴着 50」= 投递速度追不上写入速度，而不是「只有 50 条不严重」。不写回 DB 查询是刻意的：抓取比业务先倒下就更糟。",
       "id": 23,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
@@ -665,7 +741,7 @@
       "title": "最老事件等待年龄",
       "description": "条数看不出的东西都在这里：堆积 50 条以内曲线是平的，但最老一条可能已经等了很久 —— 那才是用户可感知的通知延迟。空批时为 0。",
       "id": 24,
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 75 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 83 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         { "refId": "A", "expr": "dianping_outbox_oldest_age_seconds", "legendFormat": "oldest age" }
@@ -680,7 +756,7 @@
       "title": "距上次扫描",
       "description": "扫描间隔 1s。持续接近抓取间隔（15s）说明抓取本身在漂；这个数一直涨而 pending 也涨，说明调度线程根本没在跑（@Scheduled 与 ES/Redis 补偿共用调度池），只看 pending 分不出来。",
       "id": 25,
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 75 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 83 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         { "refId": "A", "expr": "dianping_outbox_last_scan_age_seconds", "legendFormat": "since scan" }
@@ -695,7 +771,7 @@
       "title": "卡死事件回收",
       "description": "每回收一条 = 有实例在「已抢占、未投递」之间死掉过。偶发正常（发布重启），持续出现就是实例被强杀或发送卡死超 1 分钟。",
       "id": 26,
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 75 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 83 },
       "datasource": { "type": "prometheus", "uid": "dianping-prom" },
       "targets": [
         {
